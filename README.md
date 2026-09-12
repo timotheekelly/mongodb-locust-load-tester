@@ -81,6 +81,43 @@ export ATLAS_PRIVATE_KEY=...
 Without these, metrics collection is skipped with a warning and the report
 notes "metrics unavailable" for that tier rather than failing the run.
 
+## Quick start
+
+`benchmarks/locustfile.py` is a standalone Locust test — no separate seed
+step needed. Point it at any collection (new or existing) and run:
+
+```bash
+BENCH_MONGO_URI="mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority" \
+    .venv/bin/python -m locust -f benchmarks/locustfile.py
+```
+
+then open [http://localhost:8089](http://localhost:8089) for Locust's web
+UI — pick a user count and spawn rate, hit Start, and watch requests/sec and
+latency live. On first use it creates the collection/index if they don't
+exist and builds up its own working set as it inserts (reads/updates pick
+random keys from whatever's been inserted so far), so there's genuinely
+nothing else to set up first.
+
+To run one of the three named profiles (see below) instead of the default
+weights, set `BENCH_PROFILE`:
+
+```bash
+BENCH_PROFILE=read_heavy BENCH_MONGO_URI="mongodb+srv://..." \
+    .venv/bin/python -m locust -f benchmarks/locustfile.py
+```
+
+Or run it headless (no web UI), same as any other Locust test:
+
+```bash
+BENCH_PROFILE=balanced BENCH_MONGO_URI="mongodb+srv://..." \
+    .venv/bin/python -m locust -f benchmarks/locustfile.py --headless -u 10 -r 5 -t 5m
+```
+
+Everything past this point (`seed.py`, `orchestrator.py`, `report.py`) is
+optional tooling on top of that same locustfile, for when you want a fixed
+target data volume seeded identically across multiple tiers before
+comparing them — not required to just run a load test.
+
 ## Configuration
 
 - `config/base.yaml` — shared defaults: doc size (`doc_size_bytes`), nesting
@@ -101,7 +138,11 @@ notes "metrics unavailable" for that tier rather than failing the run.
 3. **cpu_intensive** — heavily weighted toward the aggregation task
    (`$match` + `$group` + `$sort`), isolating CPU/vCPU-share differences.
 
-## First-run walkthrough
+## Optional: multi-tier walkthrough (fixed data volume across tiers)
+
+Use this instead of Quick Start when you want every tier seeded to the same
+target data volume before comparing them, rather than each tier building up
+its own organic working set from a fresh, empty collection.
 
 **1. Seed one tier manually** (useful before committing to a full multi-tier
 run):
@@ -175,6 +216,13 @@ comparing all three profiles side by side, per tier.
   is unambiguous) in `on_start` and using that everywhere. If you ever see a
   stray `client` database on a cluster you've tested against, that's this
   bug from before the fix — drop it, it's not real data.
+- `BenchUser`'s working set grows via a shared `seq` counter (`_doc_count`)
+  rather than a fixed pre-seeded range, so a fresh/empty collection works
+  out of the box. The one-time index-creation/count check at startup is
+  guarded by a `threading.Lock` (cooperative under Locust's gevent runtime)
+  — without it, multiple simulated users starting at once would each read a
+  stale document count and reset the shared counter after others had
+  already started incrementing it, causing duplicate-key errors on insert.
 - Per-tier concurrency defaults come from
   `tier_testing_limits.<TIER>.default_users` in `config/base.yaml`
   (conservative for M0/Flex) and can be overridden with

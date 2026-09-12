@@ -1,4 +1,19 @@
-"""Locust workload simulator against a pre-seeded MongoDB collection.
+"""Standalone Locust workload simulator for MongoDB -- run it directly, no
+separate seed step required:
+
+    locust -f benchmarks/locustfile.py
+
+then open http://localhost:8089 for the web UI, or run headless:
+
+    BENCH_PROFILE=read_heavy BENCH_MONGO_URI="mongodb+srv://..." \
+        locust -f benchmarks/locustfile.py --headless -u 10 -r 5 -t 5m
+
+On first use it creates the collection/index if they don't exist and builds
+up its own working set as it runs (inserts grow the readable key space
+live, like a real app would). If you point it at a collection already
+pre-seeded by benchmarks/seed.py (e.g. via the orchestrator, for a fixed
+target data volume across tiers), it picks up from that existing data
+instead of starting empty -- both are valid ways to use this file.
 
 Built on locust.contrib.mongodb.MongoDBUser, which wraps PyMongo. Note this
 file does NOT use MongoDBUser's own `self.client.db` attribute or its
@@ -15,15 +30,11 @@ database entirely. All access here goes through `self.client[db_name]`
 
 Every operation is timed by firing Locust's `request` event manually, since
 none of them go through the base class's (broken) built-in timing.
-
-Run headless, e.g.:
-    BENCH_PROFILE=read_heavy BENCH_MONGO_URI="mongodb+srv://..." \
-        locust -f benchmarks/locustfile.py --headless -u 10 -r 5 -t 5m \
-        --csv results/read_heavy/small/M10/locust
 """
 
 import os
 import random
+import threading
 import time
 
 from locust import events, task
@@ -43,6 +54,11 @@ _MAX_FANOUT = _CFG.get("max_nesting_fanout", docgen.MAX_NESTING_FANOUT)
 _RANGE_LIMIT = _CFG.get("range_query_limit", 50)
 _BULK_BATCH = _CFG.get("bulk_insert_batch_size", 100)
 
+# Locust runs under gevent, which patches threading.Lock into a cooperative
+# (non-OS) lock -- this makes the one-time init below safe even though
+# multiple simulated users can call on_start() concurrently.
+_init_lock = threading.Lock()
+
 
 def _fire(request_type: str, name: str, start: float, response_length: int = 0, exception=None) -> None:
     response_time = (time.time() - start) * 1000
@@ -61,7 +77,8 @@ class BenchUser(MongoDBUser):
     db_name = _CFG["database"]
     collection_name = _CFG["collection"]
 
-    _doc_count = None  # populated lazily, shared across simulated users
+    _initialized = False  # guards one-time index/count setup, shared across simulated users
+    _doc_count = 0        # next seq to hand out; also the current size of the readable working set
 
     def on_start(self) -> None:
         # Subscript access (self.client[name]) -- NOT attribute access
@@ -69,31 +86,39 @@ class BenchUser(MongoDBUser):
         # from a MongoClient; see module docstring.
         self._coll = self.client[self.db_name][self.collection_name]
 
-        if BenchUser._doc_count is None:
-            count = self._coll.count_documents({})
-            BenchUser._doc_count = count if count > 0 else 1
-        # Offset for freshly-inserted docs during the run, kept well clear of
-        # the seeded seq range to avoid colliding with the unique index.
-        self._insert_seq_base = BenchUser._doc_count + random.randint(10**12, 10**15)
-        self._insert_counter = 0
+        if not BenchUser._initialized:
+            # Double-checked locking: many users can reach this concurrently
+            # (create_index/count_documents are network calls, so they yield
+            # the greenlet) -- without the lock, several could each read a
+            # stale count and clobber _doc_count after others had already
+            # started incrementing it, producing duplicate `seq` values.
+            with _init_lock:
+                if not BenchUser._initialized:
+                    self._coll.create_index("seq", unique=True)
+                    BenchUser._doc_count = self._coll.count_documents({})
+                    BenchUser._initialized = True
 
-    def _next_insert_seq(self) -> int:
-        self._insert_counter += 1
-        return self._insert_seq_base + self._insert_counter
+    def _next_seq(self) -> int:
+        """Hand out the next seq and grow the working set by one.
 
-    def _random_seq(self) -> int:
-        """Return a random seq from the original seeded working set.
-
-        Documents inserted during the benchmark are intentionally excluded so
-        read/update selection remains stable throughout the run.
+        Shared as a plain class attribute rather than a lock: Locust's
+        gevent-based concurrency model runs one greenlet at a time between
+        I/O yield points, so this increment can't be preempted mid-statement.
         """
+        seq = BenchUser._doc_count
+        BenchUser._doc_count += 1
+        return seq
+
+    def _random_seq(self) -> int | None:
+        """A random seq from the current working set, or None if it's still empty
+        (e.g. the very start of a run against a fresh, unseeded collection)."""
+        if BenchUser._doc_count == 0:
+            return None
         return random.randint(0, BenchUser._doc_count - 1)
 
     @task(_WEIGHTS.get("insert", 1))
     def insert_one(self):
-        doc = docgen.generate_document(
-            self._next_insert_seq(), _DOC_SIZE, _NESTING_DEPTH, _NESTING_WIDTH, _MAX_FANOUT
-        )
+        doc = docgen.generate_document(self._next_seq(), _DOC_SIZE, _NESTING_DEPTH, _NESTING_WIDTH, _MAX_FANOUT)
         start = time.time()
         try:
             self._coll.insert_one(doc)
@@ -103,9 +128,12 @@ class BenchUser(MongoDBUser):
 
     @task(_WEIGHTS.get("point_lookup", 1))
     def point_lookup(self):
+        seq = self._random_seq()
+        if seq is None:
+            return
         start = time.time()
         try:
-            doc = self._coll.find_one({"seq": self._random_seq()})
+            doc = self._coll.find_one({"seq": seq})
             _fire("MONGODB", "QUERY", start, response_length=1 if doc else 0)
         except Exception as e:
             _fire("MONGODB", "QUERY", start, exception=e)
@@ -113,6 +141,8 @@ class BenchUser(MongoDBUser):
     @task(_WEIGHTS.get("range_query", 1))
     def range_query(self):
         start_seq = self._random_seq()
+        if start_seq is None:
+            return
         start = time.time()
         try:
             cursor = self._coll.find({"seq": {"$gte": start_seq}}).sort("seq", 1).limit(_RANGE_LIMIT)
@@ -124,6 +154,8 @@ class BenchUser(MongoDBUser):
     @task(_WEIGHTS.get("update", 1))
     def update_one(self):
         seq = self._random_seq()
+        if seq is None:
+            return
         start = time.time()
         try:
             self._coll.update_one(
@@ -137,9 +169,7 @@ class BenchUser(MongoDBUser):
     @task(_WEIGHTS.get("bulk_insert", 1))
     def bulk_insert(self):
         docs = [
-            docgen.generate_document(
-                self._next_insert_seq(), _DOC_SIZE, _NESTING_DEPTH, _NESTING_WIDTH, _MAX_FANOUT
-            )
+            docgen.generate_document(self._next_seq(), _DOC_SIZE, _NESTING_DEPTH, _NESTING_WIDTH, _MAX_FANOUT)
             for _ in range(_BULK_BATCH)
         ]
         start = time.time()
