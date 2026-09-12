@@ -157,9 +157,11 @@ def generate_profile_report(profile: str, volume_label: str) -> Path:
         cpu = _avg_metric(atlas, "PROCESS_CPU_USER")
         iops_r = _avg_metric(atlas, "DISK_PARTITION_IOPS_READ")
         iops_w = _avg_metric(atlas, "DISK_PARTITION_IOPS_WRITE")
+        req_s = agg.get("Requests/s")
         lines.append(
             f"| {tier} | {agg.get('50%', 'n/a')} | {agg.get('95%', 'n/a')} | {agg.get('99%', 'n/a')} | "
-            f"{agg.get('Requests/s', 'n/a')} | {f'{cpu:.1f}' if cpu is not None else 'n/a'} | "
+            f"{f'{float(req_s):.1f}' if req_s not in (None, '') else 'n/a'} | "
+            f"{f'{cpu:.1f}' if cpu is not None else 'n/a'} | "
             f"{f'{iops_r:.0f}/{iops_w:.0f}' if iops_r is not None else 'n/a'} | "
             f"{'yes' if atlas.get('available') else 'NO (' + str(atlas.get('reason')) + ')'} |"
         )

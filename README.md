@@ -19,7 +19,6 @@ benchmarks/
   metrics_atlas.py     Atlas Admin API CPU/RAM/IOPS/connections pull
   orchestrator.py      reseed + run + capture metrics, per tier or all tiers
   report.py            per-profile charts/report + cross-workload view
-  decision_matrix.py   plain-language threshold framework from real results
 results/<profile>/<volume>/<tier>/   locust CSVs + atlas_metrics.json per run
 reports/                             generated charts + markdown reports
 ```
@@ -30,6 +29,30 @@ reports/                             generated charts + markdown reports
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
+
+Copy `.env.example` to `.env` and fill in real values (`.env` is gitignored,
+never commit it). Nothing in this repo auto-loads `.env` — source it into
+your shell before running anything:
+
+```bash
+cp .env.example .env   # then edit .env with real values
+set -a; source .env; set +a
+```
+
+**macOS SSL certificate error**: if you see
+`[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get
+local issuer certificate` when connecting to Atlas, your Python install
+can't find a CA bundle. Fix (one-time per shell session, or add to your
+shell profile):
+
+```bash
+export SSL_CERT_FILE=$(.venv/bin/python -c "import certifi; print(certifi.where())")
+```
+
+`certifi` is already a listed dependency, so `pip install -r requirements.txt`
+covers it — this just points Python/OpenSSL at that bundle. Every command
+below assumes both `.env` is sourced and `SSL_CERT_FILE` is set in the same
+shell.
 
 [tiers.yaml](tiers.yaml) doesn't hold secrets directly — each tier entry
 names an env var to read the real connection string from (`mongo_uri_env`),
@@ -135,30 +158,23 @@ resource charts + a data table) for that one profile across tiers. The
 second produces `reports/cross_workload/small_cross_workload_report.md`
 comparing all three profiles side by side, per tier.
 
-**5. Generate the decision matrix** (after results exist for the profiles/
-tiers you care about):
-
-```bash
-.venv/bin/python -m benchmarks.decision_matrix --volume small
-```
-
-Reads each tier/profile's Locust time-series history and flags where p99
-latency jumps sharply (≥2x its early-run baseline), producing
-`reports/small_decision_matrix.md` with statements like "on the read-heavy
-workload, p99 latency held steady on M0, then degraded sharply once
-throughput reached ~N req/s." Thresholds are derived from the actual run
-data, not hardcoded.
-
 ## Notes
 
 - `docgen.py` is the single source of document shape/size logic, shared by
   seeding and the live workload, so seeded and freshly-inserted documents
   are identical in shape.
-- `locustfile.py`'s `point_lookup` task times via
-  `MongoDBUser.execute_query`, matching the base class's own instrumentation
-  ("QUERY" in Locust's stats). All other tasks (insert, range query, update,
-  bulk insert, aggregate) fire Locust's `request` event manually, since the
-  base class doesn't time them.
+- All six tasks in `locustfile.py` fire Locust's `request` event manually
+  (none rely on `MongoDBUser`'s own built-in timing). This is deliberate:
+  upstream's `MongoDBClient.__init__` does `self.db = self.client[db_name]`,
+  where `self.client` is *attribute* access on a `MongoClient` — which
+  PyMongo defines as shorthand for `self["client"]` (a database literally
+  named `client`), not "myself". That silently sends all traffic through
+  `execute_query`/`self.db[...]` into a bogus `client` database instead of
+  the real one. `BenchUser` avoids this entirely by caching
+  `self.client[self.db_name][self.collection_name]` (subscript access, which
+  is unambiguous) in `on_start` and using that everywhere. If you ever see a
+  stray `client` database on a cluster you've tested against, that's this
+  bug from before the fix — drop it, it's not real data.
 - Per-tier concurrency defaults come from
   `tier_testing_limits.<TIER>.default_users` in `config/base.yaml`
   (conservative for M0/Flex) and can be overridden with
