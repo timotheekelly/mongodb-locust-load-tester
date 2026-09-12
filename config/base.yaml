@@ -1,0 +1,67 @@
+# Shared defaults, overridden by profile-specific config and then by env vars.
+# Env var override pattern: BENCH_<UPPER_SNAKE_KEY>, e.g. BENCH_DOC_SIZE_BYTES=5000
+
+mongo_uri: "mongodb://localhost:27017"
+database: "bench"
+collection: "docs"
+
+# Document shape
+doc_size_bytes: 10240         # 10 KiB default target document size (BSON-measured)
+nesting_depth: 2              # maximum subdocument depth below the root
+nesting_width: 3              # child subdocuments per level
+max_nesting_fanout: 50        # safety cap on width^depth; generation refuses beyond this
+
+# Working set
+target_volume_bytes: 2147483648   # 2 GiB default; presets below
+seed_batch_size: 500              # docs per bulk insert during seeding
+
+# Bulk insert task
+# Kept small deliberately: at the default 10 KiB doc size, 100 docs/call (~1MiB)
+# was enough to blow through M0's 512MiB storage cap within a few minutes of a
+# write-heavy (balanced) run on top of a 256MiB (tiny) seed. 20 docs/call keeps
+# total write growth well under M0's headroom for a full default run.
+bulk_insert_batch_size: 20    # ~20 docs * 10 KiB = ~200 KiB per bulk call
+
+# Range query
+range_query_limit: 50
+
+# Task weights (relative; used by locustfile.py to build weighted tasks)
+weights:
+  insert: 1
+  point_lookup: 1
+  range_query: 1
+  update: 1
+  bulk_insert: 1
+  aggregate: 1
+
+# Locust runtime (used by orchestrator when invoking locust headless)
+locust:
+  users: 10
+  spawn_rate: 5
+  run_time: "5m"
+
+# Tier storage/connection limits (safety checks in orchestrator.py)
+tier_testing_limits:
+  M0:
+    max_storage_bytes: 536870912       # 512 MiB
+    max_connections: 500
+    default_users: 5
+  FLEX:
+    max_storage_bytes: 5368709120      # 5 GiB conservative test cap
+    max_connections: 500
+    default_users: 10
+  M10:
+    max_storage_bytes: null
+    max_connections: 1500
+    default_users: 20
+  M30:
+    max_storage_bytes: null
+    max_connections: 3000
+    default_users: 50
+
+# Named volume presets (bytes)
+volume_presets:
+  tiny: 268435456          # 256 MiB
+  small: 2147483648        # 2 GiB
+  medium: 21474836480      # 20 GiB
+  large: 536870912000      # 500 GiB

@@ -1,0 +1,8 @@
+# Read-heavy: ~90%+ reads (point lookups + range queries), minimal writes.
+weights:
+  insert: 1
+  point_lookup: 45
+  range_query: 45
+  update: 5
+  bulk_insert: 1
+  aggregate: 3

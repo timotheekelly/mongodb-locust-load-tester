@@ -1,0 +1,27 @@
+# List of Atlas clusters under test. Fill in real connection strings.
+# tier_label must match a key in config/base.yaml's tier_limits section
+# (M0, FLEX, M10, M30) so storage/connection safety checks apply.
+#
+# atlas_project_id / atlas_cluster_name are optional -- only needed if you
+# want server-side CPU/RAM/IOPS metrics pulled via the Atlas Admin API
+# (see benchmarks/metrics_atlas.py). Omit them (or leave ATLAS_PUBLIC_KEY /
+# ATLAS_PRIVATE_KEY env vars unset) to skip metrics collection gracefully.
+atlas:
+  project_id_env: ATLAS_PROJECT_ID
+
+tiers:
+  - tier_label: M0
+    mongo_uri_env: M0_MONGO_URI
+    cluster_name_env: M0_ATLAS_CLUSTER_NAME
+
+  - tier_label: FLEX
+    mongo_uri_env: FLEX_MONGO_URI
+    cluster_name_env: FLEX_ATLAS_CLUSTER_NAME
+
+  - tier_label: M10
+    mongo_uri_env: M10_MONGO_URI
+    cluster_name_env: M10_ATLAS_CLUSTER_NAME
+
+  - tier_label: M30
+    mongo_uri_env: M30_MONGO_URI
+    cluster_name_env: M30_ATLAS_CLUSTER_NAME

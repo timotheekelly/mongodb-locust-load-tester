@@ -1,0 +1,13 @@
+# CPU-intensive: heavily weighted toward the aggregation task, to isolate
+# CPU/vCPU-share differences rather than I/O or connection limits.
+# Smaller doc size than the default -- this profile stresses the query
+# engine, not payload size.
+doc_size_bytes: 8192   # 8KB
+
+weights:
+  insert: 2
+  point_lookup: 5
+  range_query: 5
+  update: 3
+  bulk_insert: 1
+  aggregate: 60

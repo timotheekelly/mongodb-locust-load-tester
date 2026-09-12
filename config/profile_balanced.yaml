@@ -1,0 +1,8 @@
+# Balanced 50/50: even split between reads and writes, typical OLTP-ish mix.
+weights:
+  insert: 15
+  point_lookup: 25
+  range_query: 25
+  update: 25
+  bulk_insert: 5
+  aggregate: 5
