@@ -1,6 +1,8 @@
-# List of Atlas clusters under test. Fill in real connection strings.
-# tier_label must match a key in config/base.yaml's tier_limits section
-# (M0, FLEX, M10, M30) so storage/connection safety checks apply.
+# List of Atlas clusters under test. To add/change a connection string, set
+# the env var named by mongo_uri_env below (in .env) -- don't put the URI
+# literally in this file. tier_label must match a key in config/base.yaml's
+# tier_testing_limits section (M0, FLEX, M10, M30) so storage/connection
+# safety checks and default concurrency apply.
 #
 # atlas_project_id / atlas_cluster_name are optional -- only needed if you
 # want server-side CPU/RAM/IOPS metrics pulled via the Atlas Admin API
