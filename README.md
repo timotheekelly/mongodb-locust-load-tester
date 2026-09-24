@@ -125,47 +125,84 @@ BENCH_PROFILE=balanced BENCH_MONGO_URI="mongodb+srv://..." \
 ## Option 2: compare tiers with the orchestrator
 
 This is the tool for "run [some/all] workloads against [some/all] of my
-tiers and give me the results at the end." One command:
+tiers and give me the results at the end." It never runs anything
+concurrently — one (profile, tier) combination reseeds, runs, and finishes
+before the next one starts, so tiers don't compete for your machine's CPU
+as load generator (run this script from separate load-generation hosts per
+tier if you want true parallelism). It stops on its own once every
+combination is done and prints a summary — it's not a long-lived server
+you need to Ctrl+C.
+
+For each combination it: reseeds that tier's collection to the target
+volume, runs the Locust workload headless for the configured duration
+(5 minutes by default — see `--run-time` below), pulls Atlas metrics for
+that exact time window (if configured), then moves to the next one.
+
+**How long a run takes**: roughly `(seed time + run time) x profiles x
+tiers`. Seeding `tiny` (256MiB) takes about 2 minutes; the default Locust
+run-time is 5 minutes. So one profile against one tier is ~7 minutes; all
+three profiles against one tier is ~21 minutes; add more tiers and it
+multiplies accordingly. Use `--run-time` to shorten this for a quick check
+(see the sample run below).
+
+### Adding / changing connection strings
+
+Nothing to code — just data:
+
+1. Put the real connection string in `.env` under the var name `tiers.yaml`
+   already expects (e.g. `M0_MONGO_URI=mongodb+srv://user:pass@...`).
+2. If it's a genuinely new tier (not already one of M0/FLEX/M10/M30), add
+   an entry to `tiers.yaml`:
+   ```yaml
+   - tier_label: M10_EAST      # any label you want
+     mongo_uri_env: M10_EAST_MONGO_URI
+     cluster_name_env: M10_EAST_ATLAS_CLUSTER_NAME   # optional, for Atlas metrics
+   ```
+3. `set -a; source .env; set +a` in your shell, then run.
+
+### Running one tier, some tiers, or all tiers
+
+`--tier` selects a single `tier_label` from `tiers.yaml`; omit it to run
+every tier listed there.
 
 ```bash
-# everything: all 3 profiles x all tiers in tiers.yaml, sequentially
-.venv/bin/python -m benchmarks.orchestrator --volume small
+# just M0 (must use --volume tiny -- see note below)
+.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume tiny --tier M0
+
+# just M10
+.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier M10
+
+# every tier in tiers.yaml (M0, FLEX, M10, M30) -- note --volume tiny caps ALL of them
+# to M0's size; for a real multi-tier comparison, run M0 separately at `tiny`
+# and the rest together at `small` or larger (see the M0 storage cap note below)
+.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier FLEX
+.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier M10
+.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier M30
 ```
 
-For each (profile, tier) pair, in turn, it: reseeds that tier's collection
-to the target volume, runs the Locust workload headless, pulls Atlas
-metrics for that exact time window (if configured), then moves to the
-next combination. Sequentially, not concurrently — so tiers don't compete
-for your machine's CPU as load generator; run this script from separate
-load-generation hosts per tier if you want to parallelize.
+**M0's storage cap (~512MiB) means you must use `--volume tiny` for it** —
+`small`/`medium`/`large` will be refused outright (with a clear message)
+rather than failing partway through. This is enforced automatically per
+tier via `tier_testing_limits` in `config/base.yaml`. Since `--volume`
+applies to every tier in a single invocation, running M0 alongside larger
+tiers means either testing M0 separately at `tiny`, or accepting a smaller
+`tiny` volume for all of them in one run — `small` and above are expected
+to work fine on FLEX/M10/M30 if you run those without M0 in the same
+command.
 
-At the end it prints a summary table across every run:
+### Running one profile, some profiles, or all profiles
 
-```
-====================================================================================================
-SUMMARY -- all runs
-====================================================================================================
-Profile         Tier     Requests    Fails     p50     p95     p99     req/s  Atlas metrics
-----------------------------------------------------------------------------------------------------
-read_heavy      M0          15747        0      79     220     350      52.5             no
-balanced        M0          13048        0      64     340     580      43.5             no
-cpu_intensive   M0           5531        0     100     280    4300      18.5             no
-====================================================================================================
-```
-
-You can narrow it down in either dimension:
+`--profile` takes a single name, a comma-separated subset, or can be
+omitted entirely to run all three:
 
 ```bash
 # one profile, all tiers
 .venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small
 
-# one profile, one tier
-.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier M10
-
-# a subset of profiles, one tier
+# a subset of profiles
 .venv/bin/python -m benchmarks.orchestrator --profile read_heavy,balanced --volume tiny --tier M0
 
-# every profile, one tier
+# every profile (read_heavy, balanced, cpu_intensive) -- just omit --profile
 .venv/bin/python -m benchmarks.orchestrator --volume tiny --tier M0
 ```
 
@@ -173,11 +210,48 @@ Other flags: `--users`, `--spawn-rate`, `--run-time` override Locust's
 defaults for every run in the batch; `--tiers-file` points at a different
 tiers config if you keep more than one.
 
-**M0's storage cap (~512MiB) means you must use `--volume tiny` for it** —
-`small`/`medium`/`large` will be refused outright (with a clear message)
-rather than failing partway through. This is enforced automatically per
-tier via `tier_testing_limits` in `config/base.yaml`; `small` and above are
-expected to work fine on M10/M30/Flex.
+### Sample run (30 seconds, one profile, one tier)
+
+For a quick end-to-end check without waiting ~7 minutes, override
+`--run-time`:
+
+```bash
+.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume tiny --tier M0 --run-time 30s
+```
+
+```
+Running profiles ['read_heavy'] against tiers ['M0'] at volume 'tiny'
+
+=== [read_heavy / M0] reseeding to 0.25GB ===
+Seeding target: 0.25GB / 10240 bytes per doc = 26214 documents. Rough estimate at ~500 inserts/sec: ~0.9 minutes (varies a lot with tier and network).
+Dropping existing collection bench.docs (if any)...
+  10000/26214 docs inserted (237/sec)
+  20000/26214 docs inserted (243/sec)
+  26214/26214 docs inserted (243/sec)
+Done: 26214 documents seeded in 108.0s.
+=== [read_heavy / M0] running Locust (5 users, 30s) ===
+=== [read_heavy / M0] pulling Atlas metrics for the test window ===
+  WARNING: Atlas metrics unavailable for [read_heavy / M0]: no processes found for cluster 'benchmark-m0'
+=== [read_heavy / M0] done, results in results/read_heavy/tiny/M0 ===
+
+====================================================================================================
+SUMMARY -- all runs
+====================================================================================================
+Profile         Tier       Requests    Fails     p50     p95     p99     req/s  Atlas metrics
+---------------------------------------------------------------------------------------------
+read_heavy      M0             1422        0      89     240     420      48.8             no
+====================================================================================================
+Full CSVs, atlas_metrics.json, and run_metadata.json for each run are under results/<profile>/<volume>/<tier>/
+Generate charts + a markdown report per profile with: python -m benchmarks.report --profile <profile> --volume <volume>
+```
+
+(Exact numbers vary run to run — this is real output from a live M0
+cluster. The "Atlas metrics: no" here means the Atlas API credentials
+*were* configured but `M0_ATLAS_CLUSTER_NAME`'s value didn't match a
+process on the account — if you see this instead of "credentials not
+set," double check that env var's value against the cluster's actual name
+in Atlas. Without any Atlas credentials configured at all, the message
+reads `ATLAS_PUBLIC_KEY/ATLAS_PRIVATE_KEY not set in environment` instead.)
 
 Every run's full Locust CSVs, `atlas_metrics.json` (or a clear
 "unavailable" reason), and `run_metadata.json` land in
@@ -270,14 +344,16 @@ refuses upfront if the target volume exceeds the given tier's storage cap
   which is unambiguous) in `on_start` and using that everywhere. If you
   ever see a stray `client` database on a cluster you've tested against,
   that's this bug from before the fix — drop it, it's not real data.
-- `BenchUser`'s working set grows via a shared `seq` counter (`_doc_count`)
+- `BenchUser`'s working set grows via a shared `_next_sequence` counter
   rather than a fixed pre-seeded range, so a fresh/empty collection works
-  out of the box. The one-time index-creation/count check at startup is
-  guarded by a `threading.Lock` (cooperative under Locust's gevent
-  runtime) — without it, multiple simulated users starting at once would
-  each read a stale document count and reset the shared counter after
-  others had already started incrementing it, causing duplicate-key
-  errors on insert.
+  out of the box — the readable range (`_max_readable_sequence`) only
+  advances after a write actually succeeds, so a failed insert can't make
+  a later read/update target a document that was never written. The
+  one-time index-creation/highest-seq lookup at startup is guarded by a
+  `threading.Lock` (cooperative under Locust's gevent runtime) — without
+  it, multiple simulated users starting at once could each read a stale
+  starting point and reset the shared counter after others had already
+  started allocating sequences, causing duplicate-key errors on insert.
 - Per-tier concurrency defaults come from
   `tier_testing_limits.<TIER>.default_users` in `config/base.yaml`
   (conservative for M0/Flex) and can be overridden with
