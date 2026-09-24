@@ -326,6 +326,15 @@ commitment** — it prints an estimate and a warning before starting, and
 refuses upfront if the target volume exceeds the given tier's storage cap
 (via `--tier-label`) rather than failing confusingly partway through.
 
+If a batch hits a duplicate-key error (`seq` already exists — this can
+happen if a stray writer, e.g. an orphaned Locust process from an earlier
+run you Ctrl+C'd, is still inserting into the same collection concurrently
+with a fresh seed), it prints a short warning naming the affected `seq`
+range and keeps going rather than crashing the whole run or dumping the
+full failed document (which can be large — it includes the padded
+`filler` field). Any other kind of write error still stops the run with
+a concise summary, not a raw dump.
+
 ## Notes on things that weren't obvious while building this
 
 - All six tasks in `locustfile.py` fire Locust's `request` event manually

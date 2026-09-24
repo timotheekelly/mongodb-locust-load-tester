@@ -15,6 +15,7 @@ import sys
 import time
 
 from pymongo import MongoClient
+from pymongo.errors import BulkWriteError
 
 from benchmarks import docgen
 from benchmarks.config import load_config, resolve_volume
@@ -78,7 +79,33 @@ def seed(cfg: dict, target_volume_bytes: int, tier_label: str | None = None) -> 
             docgen.generate_document(seq + i, doc_size, nesting_depth, nesting_width, max_fanout)
             for i in range(n)
         ]
-        coll.insert_many(batch, ordered=False)
+        try:
+            coll.insert_many(batch, ordered=False)
+        except BulkWriteError as e:
+            write_errors = e.details.get("writeErrors", [])
+            duplicates = [err for err in write_errors if err.get("code") == 11000]
+            other = [err for err in write_errors if err.get("code") != 11000]
+            if other:
+                # Something other than a duplicate key -- summarize (never dump
+                # the full failed document, which includes the large filler
+                # field) and stop, since this isn't a case we know how to
+                # recover from safely.
+                codes = sorted({err.get("code") for err in other})
+                raise RuntimeError(
+                    f"insert_many failed with {len(other)} non-duplicate-key error(s) "
+                    f"(codes: {codes}); first message: {other[0].get('errmsg')}"
+                ) from None
+            if duplicates:
+                # Another writer already has these seq values (e.g. a stray
+                # process from an earlier run against this same collection).
+                # With ordered=False, every non-conflicting doc in this batch
+                # still got inserted -- treat this as a warning, not fatal.
+                dup_seqs = [err["keyValue"].get("seq") for err in duplicates]
+                print(
+                    f"  WARNING: {len(duplicates)} duplicate-key error(s) in this batch "
+                    f"(seq {min(dup_seqs)}-{max(dup_seqs)} already existed -- likely a "
+                    "stray writer against this collection). Continuing."
+                )
         seq += n
         inserted += n
         if inserted % (batch_size * 20) == 0 or inserted == doc_count:
