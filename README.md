@@ -39,6 +39,7 @@ benchmarks/
   orchestrator.py              optional: seed + run + summarize across profiles/tiers
   metrics_atlas.py             optional: pulls CPU/RAM/IOPS from the Atlas Admin API
   report.py                    optional: turns results/ into charts + a markdown report
+  tui.py                       optional: Textual TUI for picking profiles/tiers and running the orchestrator
 results/<profile>/<volume>/<tier>/   Locust CSVs + atlas_metrics.json + run_metadata.json per run
 reports/                             generated charts + markdown reports (optional, from report.py)
 ```
@@ -266,6 +267,21 @@ throughput/resource charts + a data table) for that one profile across
 tiers. The second produces
 `reports/cross_workload/small_cross_workload_report.md` comparing all
 three profiles side by side, per tier.
+
+### Optional: a TUI instead of typing flags
+
+```bash
+.venv/bin/python -m benchmarks.tui
+```
+
+A [Textual](https://textual.textualize.io/) terminal UI for the same
+orchestrator — check the profiles/tiers you want with checkboxes, adjust
+volume/users/spawn-rate/run-time, hit Run, and watch the output stream live
+in the log pane below (Cancel or Ctrl+C stops it early). It's a thin
+wrapper: under the hood it builds and runs the exact same
+`python -m benchmarks.orchestrator ...` command line, so behavior always
+matches the CLI. Needs the same env setup as everything else — `.env`
+sourced and `SSL_CERT_FILE` set in the shell you launch it from.
 
 ## Workload profiles
 
