@@ -367,3 +367,22 @@ refuses upfront if the target volume exceeds the given tier's storage cap
   `atlas_project_id`/cluster name. Without these, metrics collection is
   skipped with a clear warning rather than failing the run, and the
   summary/report just show "unavailable" for that tier.
+- Matching a tier's processes by cluster *name* is unreliable and was a
+  real bug here: a process record's `id` is an internal replica-set node
+  name that, for shared tiers like M0, contains no trace of the cluster's
+  friendly name at all (dedicated tiers like M10/M30 happen to include it,
+  which is why this wasn't obvious at first). `metrics_atlas.py` resolves
+  the cluster's real hostnames from its own connection string and matches
+  those against each process's `userAlias` instead, which works for every
+  tier. Separately, IOPS is only exposed via a per-disk-partition
+  sub-resource, not the process-level measurements endpoint used for
+  CPU/memory/connections — requesting it there returns a 404
+  `INVALID_METRIC_NAME`, so it's fetched from `.../disks/{partition}/measurements`
+  instead.
+- **M0 (free/shared tier) genuinely only reports `CONNECTIONS` at the
+  process level** — no CPU, memory, or IOPS data at all, confirmed against
+  the live API (M10/M30 report all of it). This is a real Atlas platform
+  limitation for the shared tier, not a bug: the fetch drops any metric
+  name the API rejects and returns whatever's actually available, so an M0
+  run still shows `Atlas metrics: yes` with just connection counts, while
+  dedicated tiers get the full picture.

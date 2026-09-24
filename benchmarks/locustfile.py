@@ -238,7 +238,7 @@ class BenchUser(MongoDBUser):
         start = time.perf_counter()
 
         try:
-            result = self._coll.update_one(
+            self._coll.update_one(
                 {"seq": seq},
                 {
                     "$set": {

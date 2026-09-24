@@ -6,3 +6,4 @@ reports/*/
 !results/.gitkeep
 !reports/.gitkeep
 .env
+.claude/

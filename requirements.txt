@@ -3,5 +3,4 @@ pymongo>=4.8
 PyYAML>=6.0
 requests>=2.32
 matplotlib>=3.9
-python-dateutil>=2.9
 certifi>=2024.7
