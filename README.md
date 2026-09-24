@@ -225,13 +225,12 @@ Running profiles ['read_heavy'] against tiers ['M0'] at volume 'tiny'
 === [read_heavy / M0] reseeding to 0.25GB ===
 Seeding target: 0.25GB / 10240 bytes per doc = 26214 documents. Rough estimate at ~500 inserts/sec: ~0.9 minutes (varies a lot with tier and network).
 Dropping existing collection bench.docs (if any)...
-  10000/26214 docs inserted (237/sec)
-  20000/26214 docs inserted (243/sec)
-  26214/26214 docs inserted (243/sec)
-Done: 26214 documents seeded in 108.0s.
+  10000/26214 docs inserted (252/sec)
+  20000/26214 docs inserted (240/sec)
+  26214/26214 docs inserted (242/sec)
+Done: 26214 documents seeded in 108.2s.
 === [read_heavy / M0] running Locust (5 users, 30s) ===
 === [read_heavy / M0] pulling Atlas metrics for the test window ===
-  WARNING: Atlas metrics unavailable for [read_heavy / M0]: no processes found for cluster 'benchmark-m0'
 === [read_heavy / M0] done, results in results/read_heavy/tiny/M0 ===
 
 ====================================================================================================
@@ -239,19 +238,17 @@ SUMMARY -- all runs
 ====================================================================================================
 Profile         Tier       Requests    Fails     p50     p95     p99     req/s  Atlas metrics
 ---------------------------------------------------------------------------------------------
-read_heavy      M0             1422        0      89     240     420      48.8             no
+read_heavy      M0             1198        0      96     300     630      41.2            yes
 ====================================================================================================
 Full CSVs, atlas_metrics.json, and run_metadata.json for each run are under results/<profile>/<volume>/<tier>/
 Generate charts + a markdown report per profile with: python -m benchmarks.report --profile <profile> --volume <volume>
 ```
 
 (Exact numbers vary run to run — this is real output from a live M0
-cluster. The "Atlas metrics: no" here means the Atlas API credentials
-*were* configured but `M0_ATLAS_CLUSTER_NAME`'s value didn't match a
-process on the account — if you see this instead of "credentials not
-set," double check that env var's value against the cluster's actual name
-in Atlas. Without any Atlas credentials configured at all, the message
-reads `ATLAS_PUBLIC_KEY/ATLAS_PRIVATE_KEY not set in environment` instead.)
+cluster, with Atlas API credentials configured. Without those, the same
+run instead prints a `WARNING: Atlas metrics unavailable for [read_heavy /
+M0]: ATLAS_PUBLIC_KEY/ATLAS_PRIVATE_KEY not set in environment` line and
+the summary's last column reads `no`.)
 
 Every run's full Locust CSVs, `atlas_metrics.json` (or a clear
 "unavailable" reason), and `run_metadata.json` land in
