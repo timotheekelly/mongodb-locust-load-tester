@@ -22,6 +22,10 @@ from requests.auth import HTTPDigestAuth
 
 ATLAS_API_BASE = "https://cloud.mongodb.com/api/atlas/v2"
 ATLAS_API_VERSION_HEADER = "application/vnd.atlas.2023-11-15+json"
+# Flex-tier clusters live under a separate /flexClusters resource, not
+# /clusters, and only exist in a newer API version than the rest of this
+# module uses -- see _get_cluster_hostnames.
+ATLAS_FLEX_API_VERSION_HEADER = "application/vnd.atlas.2024-11-13+json"
 
 # Metrics measured -- see Atlas Admin API "measurements" for the full list.
 # CPU/memory/connections are process-level; IOPS is only exposed per disk
@@ -70,7 +74,14 @@ def fetch_process_metrics(
     try:
         processes = _list_processes(project_id, cluster_name, creds)
         if not processes:
-            return {"available": False, "reason": f"no processes found for cluster '{cluster_name}'"}
+            return {
+                "available": False,
+                "reason": (
+                    f"no processes found for cluster '{cluster_name}' -- if this is a Flex-tier "
+                    "cluster, this is expected: Flex doesn't expose process-level monitoring via "
+                    "the Atlas API at all (similar to, but more limited than, M0's partial support)"
+                ),
+            }
 
         per_process: dict[str, Any] = {}
         for hostname_port in processes:
@@ -97,7 +108,13 @@ def fetch_process_metrics(
 def _get_cluster_hostnames(project_id: str, cluster_name: str, creds: tuple[str, str]) -> set[str]:
     """Return the real hostnames (no port) backing a cluster, from its
     connection string. Needed because matching by cluster *name* against
-    process records is unreliable -- see _list_processes."""
+    process records is unreliable -- see _list_processes.
+
+    Tries the regular dedicated/shared-tier /clusters resource first, then
+    falls back to /flexClusters (Flex-tier clusters -- e.g. the successor to
+    M2/M5 -- aren't visible under /clusters at all, and only exist in a
+    newer API version than the rest of this module targets).
+    """
     url = f"{ATLAS_API_BASE}/groups/{project_id}/clusters/{cluster_name}"
     resp = requests.get(
         url,
@@ -105,6 +122,14 @@ def _get_cluster_hostnames(project_id: str, cluster_name: str, creds: tuple[str,
         headers={"Accept": ATLAS_API_VERSION_HEADER},
         timeout=30,
     )
+    if resp.status_code in (400, 404):
+        flex_url = f"{ATLAS_API_BASE}/groups/{project_id}/flexClusters/{cluster_name}"
+        resp = requests.get(
+            flex_url,
+            auth=HTTPDigestAuth(*creds),
+            headers={"Accept": ATLAS_FLEX_API_VERSION_HEADER},
+            timeout=30,
+        )
     resp.raise_for_status()
     standard = resp.json().get("connectionStrings", {}).get("standard", "")
     hosts_part = standard.split("://", 1)[-1].split("/", 1)[0]

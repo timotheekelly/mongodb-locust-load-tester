@@ -162,8 +162,8 @@ Nothing to code — just data:
 
 ### Running one tier, some tiers, or all tiers
 
-`--tier` selects a single `tier_label` from `tiers.yaml`; omit it to run
-every tier listed there.
+`--tier` takes a single `tier_label`, a comma-separated subset, or can be
+omitted entirely to run every tier in `tiers.yaml`:
 
 ```bash
 # just M0 (must use --volume tiny -- see note below)
@@ -172,12 +172,11 @@ every tier listed there.
 # just M10
 .venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier M10
 
-# every tier in tiers.yaml (M0, FLEX, M10, M30) -- note --volume tiny caps ALL of them
-# to M0's size; for a real multi-tier comparison, run M0 separately at `tiny`
-# and the rest together at `small` or larger (see the M0 storage cap note below)
-.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier FLEX
-.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier M10
-.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier M30
+# FLEX, M10, and M30 together at `small` (M0 excluded -- see storage cap note below)
+.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small --tier FLEX,M10,M30
+
+# every tier in tiers.yaml -- just omit --tier
+.venv/bin/python -m benchmarks.orchestrator --profile read_heavy --volume small
 ```
 
 **M0's storage cap (~512MiB) means you must use `--volume tiny` for it** —
@@ -383,3 +382,12 @@ refuses upfront if the target volume exceeds the given tier's storage cap
   name the API rejects and returns whatever's actually available, so an M0
   run still shows `Atlas metrics: yes` with just connection counts, while
   dedicated tiers get the full picture.
+- **Flex-tier clusters need a different Atlas API resource entirely**:
+  they don't exist under `/clusters` at all (only `/flexClusters`, and
+  only in a newer API version), so looking one up the same way as
+  M0/M10/M30 returned a confusing 400. `metrics_atlas.py` now tries
+  `/clusters/{name}` first and falls back to `/flexClusters/{name}` on a
+  400/404. Beyond that, **Flex has zero process-level monitoring at all**
+  — it doesn't show up in `/processes`, full stop, not even connections
+  like M0 gets. A Flex run correctly shows `Atlas metrics: no` with a
+  reason explaining that's expected, not a failure.

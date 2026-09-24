@@ -222,7 +222,11 @@ def main() -> None:
     )
     parser.add_argument("--volume", default="small", help="tiny/small/medium/large (see config/base.yaml) or a raw byte count")
     parser.add_argument("--tiers-file", default=str(Path(__file__).resolve().parent.parent / "tiers.yaml"))
-    parser.add_argument("--tier", default=None, help="Run only this tier_label (e.g. M10) instead of every tier in tiers.yaml")
+    parser.add_argument(
+        "--tier",
+        default=None,
+        help="A tier_label (e.g. M10), a comma-separated subset (e.g. FLEX,M10,M30), or omit for every tier in tiers.yaml",
+    )
     parser.add_argument("--users", type=int, default=None, help="Override Locust user count for every run")
     parser.add_argument("--spawn-rate", type=int, default=None)
     parser.add_argument("--run-time", default=None, help='e.g. "5m", "1h"')
@@ -241,9 +245,12 @@ def main() -> None:
 
     tiers, atlas_cfg = load_tiers_config(args.tiers_file)
     if args.tier:
-        tiers = [t for t in tiers if t["tier_label"].upper() == args.tier.upper()]
-        if not tiers:
-            raise SystemExit(f"No tier '{args.tier}' found in {args.tiers_file}")
+        wanted = {t.strip().upper() for t in args.tier.split(",") if t.strip()}
+        tiers = [t for t in tiers if t["tier_label"].upper() in wanted]
+        found = {t["tier_label"].upper() for t in tiers}
+        missing = wanted - found
+        if missing:
+            raise SystemExit(f"No tier(s) {sorted(missing)} found in {args.tiers_file}")
 
     print(f"Running profiles {profiles} against tiers {[t['tier_label'] for t in tiers]} at volume '{volume_label}'")
 
