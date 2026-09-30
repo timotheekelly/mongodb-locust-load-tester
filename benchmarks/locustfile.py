@@ -4,7 +4,7 @@ import threading
 import time
 
 from bson import BSON
-from locust import events, task
+from locust import LoadTestShape, events, task
 from locust.contrib.mongodb import MongoDBUser
 from pymongo import DESCENDING
 
@@ -60,6 +60,28 @@ def _fire(
     )
 
 
+if os.environ.get("BENCH_STEP_LOAD", "").lower() in ("1", "true"):
+    # Locust's core CLI dropped --step-load in favor of LoadTestShape classes;
+    # this is only defined (and only takes effect) when explicitly requested
+    # via BENCH_STEP_LOAD, so a normal -u/-r run isn't silently overridden.
+    class StepLoadShape(LoadTestShape):
+        step_users = int(os.environ["BENCH_STEP_USERS"])
+        step_seconds = int(os.environ["BENCH_STEP_SECONDS"])
+        spawn_rate = int(os.environ.get("BENCH_STEP_SPAWN_RATE", 10))
+        max_users = int(os.environ["BENCH_MAX_USERS"])
+        # A LoadTestShape makes Locust ignore --run-time entirely, so the
+        # overall duration cap has to be enforced here instead.
+        total_seconds = int(os.environ["BENCH_RUN_TIME_SECONDS"])
+
+        def tick(self):
+            run_time = self.get_run_time()
+            if run_time >= self.total_seconds:
+                return None
+            current_step = run_time // self.step_seconds
+            users = min(self.max_users, int((current_step + 1) * self.step_users))
+            return (users, self.spawn_rate)
+
+
 class BenchUser(MongoDBUser):
     abstract = False
 
@@ -67,16 +89,29 @@ class BenchUser(MongoDBUser):
     db_name = _CFG["database"]
     collection_name = _CFG["collection"]
 
-    # Shared across all simulated users.
+    # Shared across all simulated users *within this process*. In
+    # distributed mode (Locust master + worker pods on GKE), each worker is
+    # a separate OS process with its own copy of this class -- there's no
+    # cross-process coordination here, and none is needed:
+    #
+    # - Reads/updates only ever target the range that existed when THIS
+    #   process started (`_max_readable_sequence`, fixed once at startup).
+    #   Every worker sees the same pre-seeded data, so this needs no
+    #   coordination even though each worker computes it independently.
+    # - Inserts allocate from a per-process random namespace
+    #   (`_insert_seq_base`) instead of a shared counter starting at the
+    #   seeded max. Two workers independently reading "highest existing
+    #   seq" and then both incrementing their own local counter from that
+    #   same base would allocate the same seq values and collide on the
+    #   unique index -- this is exactly the failure mode a naive shared
+    #   counter would hit at scale. Randomizing each worker's insert range
+    #   makes collisions between workers (and with the seeded range)
+    #   astronomically unlikely without needing any cross-process locking.
     _initialized = False
-
-    # Sequence numbers are identifiers, not document counts. Gaps caused by
-    # failed writes are therefore harmless.
+    _insert_seq_base = 0
     _next_sequence = 0
-
-    # Highest sequence known to exist when the benchmark starts. Reads can
-    # also target newer sequences allocated during the run; misses are valid.
-    _max_readable_sequence = -1
+    _max_readable_sequence = -1  # fixed at startup: the pre-seeded range every process shares
+    _own_inserted_count = 0      # this process's own inserts, tracked separately -- see _random_seq
 
     def on_start(self) -> None:
         self._coll = self.client[self.db_name][self.collection_name]
@@ -86,28 +121,28 @@ class BenchUser(MongoDBUser):
                 if not BenchUser._initialized:
                     self._coll.create_index("seq", unique=True)
 
-                    # count_documents() cannot determine the next sequence
-                    # because seq values may contain gaps. Find the actual
-                    # highest existing sequence instead.
+                    # Only used to size the readable range -- gaps from
+                    # failed writes don't matter for that, so
+                    # count_documents() (cheaper than a sorted find) is fine
+                    # here, unlike when computing a shared insert base.
                     latest = self._coll.find_one(
                         {"seq": {"$exists": True}},
                         projection={"seq": 1},
                         sort=[("seq", DESCENDING)],
                     )
+                    BenchUser._max_readable_sequence = latest["seq"] if latest is not None else -1
 
-                    if latest is not None:
-                        highest_seq = latest["seq"]
-                        BenchUser._next_sequence = highest_seq + 1
-                        BenchUser._max_readable_sequence = highest_seq
-                    else:
-                        BenchUser._next_sequence = 0
-                        BenchUser._max_readable_sequence = -1
+                    # A random 48-bit-plus offset, unique per process with
+                    # overwhelming probability, well clear of any realistic
+                    # seeded seq range.
+                    BenchUser._insert_seq_base = random.SystemRandom().randrange(2**48, 2**62)
+                    BenchUser._next_sequence = BenchUser._insert_seq_base
 
                     BenchUser._initialized = True
 
     @classmethod
     def _allocate_seq(cls) -> int:
-        """Allocate a unique sequence number.
+        """Allocate a unique sequence number from this process's insert range.
 
         Locust's gevent execution model means this small in-memory operation
         runs without an I/O yield point between the read and increment.
@@ -118,21 +153,39 @@ class BenchUser(MongoDBUser):
 
     @classmethod
     def _mark_readable(cls, seq: int) -> None:
-        """Expand the readable sequence range after a successful write."""
-        if seq > cls._max_readable_sequence:
-            cls._max_readable_sequence = seq
+        """Let this process read back its own inserts, in addition to the
+        pre-seeded range every process starts with.
+
+        Inserted seqs live in a separate, far-away random range (see
+        on_start), so counting them (rather than folding them into
+        _max_readable_sequence) is what lets _random_seq pick one without
+        landing in the empty gap between the two ranges.
+        """
+        if seq >= cls._insert_seq_base:
+            cls._own_inserted_count += 1
 
     @classmethod
     def _random_seq(cls) -> int | None:
-        """Choose a sequence from the current readable range.
+        """Choose a sequence to read/update: either from the pre-seeded
+        range every process starts with, or (occasionally) from one of this
+        process's own successful inserts.
 
         Sequence numbers may contain gaps if writes have failed, so a point
-        lookup can legitimately return no document.
+        lookup can legitimately return no document even for a chosen seq
+        that should exist.
         """
-        if cls._max_readable_sequence < 0:
+        seeded_size = cls._max_readable_sequence + 1
+        total = seeded_size + cls._own_inserted_count
+        if total <= 0:
             return None
 
-        return random.randint(0, cls._max_readable_sequence)
+        pick = random.randint(0, total - 1)
+        if pick < seeded_size:
+            return pick
+        # One of this process's own inserts. Gaps from failed inserts mean
+        # this isn't guaranteed to hit an existing doc, same as the seeded
+        # range -- that's fine, see the docstring above.
+        return cls._insert_seq_base + (pick - seeded_size)
 
     @task(_WEIGHTS.get("insert", 1))
     def insert_one(self):

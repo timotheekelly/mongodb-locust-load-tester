@@ -20,6 +20,14 @@ Usage:
 
     # a subset of profiles, one tier
     python -m benchmarks.orchestrator --profile read_heavy,balanced --volume tiny --tier M0
+
+    # every tier (M0 -> FLEX -> M10 -> M30, in tiers.yaml order), every profile,
+    # generating load from 4 local worker processes, then writing reports
+    python -m benchmarks.orchestrator --volume small --workers 4 --report
+
+    # push a tier to failure: ramp up 50 users every minute until it breaks
+    python -m benchmarks.orchestrator --tier M30 --workers 8 --users 5000 \\
+        --step-load --step-users 50 --step-time 1m --run-time 30m --report
 """
 
 import argparse
@@ -32,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from locust.util.timespan import parse_timespan
 
 from benchmarks import metrics_atlas, seed
 from benchmarks.config import load_config, resolve_volume
@@ -63,6 +72,45 @@ def check_storage_cap(cfg: dict, tier_label: str, target_volume_bytes: int) -> N
         )
 
 
+def _run_locust(
+    locustfile_path: str,
+    load_flags: list[str],
+    csv_prefix: str,
+    proc_env: dict,
+    workers: int,
+) -> tuple[int, list[int]]:
+    """Run Locust either as a single headless process, or (workers > 1) as a
+    local master + N worker processes talking over Locust's own master-worker
+    protocol on localhost -- the same distributed code path used on GKE, just
+    with every process on this machine. Returns (master_exit_code,
+    [worker_exit_codes])."""
+    base_cmd = [sys.executable, "-m", "locust", "-f", locustfile_path]
+
+    if workers <= 1:
+        cmd = base_cmd + ["--headless", *load_flags, "--csv", csv_prefix, "--csv-full-history"]
+        result = subprocess.run(cmd, env=proc_env)
+        return result.returncode, []
+
+    master_cmd = base_cmd + [
+        "--headless",
+        "--master",
+        "--expect-workers",
+        str(workers),
+        *load_flags,
+        "--csv",
+        csv_prefix,
+        "--csv-full-history",
+    ]
+    worker_cmd = base_cmd + ["--worker", "--master-host", "127.0.0.1"]
+
+    master_proc = subprocess.Popen(master_cmd, env=proc_env)
+    worker_procs = [subprocess.Popen(worker_cmd, env=proc_env) for _ in range(workers)]
+
+    master_rc = master_proc.wait()
+    worker_rcs = [p.wait() for p in worker_procs]
+    return master_rc, worker_rcs
+
+
 def run_tier(
     profile: str,
     volume_label: str,
@@ -72,6 +120,10 @@ def run_tier(
     users: int | None,
     spawn_rate: int | None,
     run_time: str | None,
+    workers: int = 1,
+    step_load: bool = False,
+    step_users: int | None = None,
+    step_time: str | None = None,
 ) -> dict:
     """Reseed + run one (profile, tier) combination. Returns a small summary
     dict describing what happened, for the final consolidated printout."""
@@ -99,37 +151,46 @@ def run_tier(
     print(f"\n=== [{profile} / {tier_label}] reseeding to {target_volume_bytes / 1024**3:.2f}GB ===")
     seed.seed(cfg, target_volume_bytes, tier_label=tier_label)
 
-    print(f"=== [{profile} / {tier_label}] running Locust ({effective_users} users, {effective_run_time}) ===")
+    load_desc = f"{effective_users} users" if not step_load else f"stepping to {effective_users} users, +{step_users}/{step_time}"
+    print(f"=== [{profile} / {tier_label}] running Locust ({load_desc}, {workers} worker(s), {effective_run_time}) ===")
     run_start = datetime.now(timezone.utc)
 
     env_overrides = {"BENCH_PROFILE": profile, "BENCH_MONGO_URI": mongo_uri}
+    if step_load:
+        # Locust's CLI dropped --step-load; ramping is done via a LoadTestShape
+        # class in locustfile.py that only activates when BENCH_STEP_LOAD is set.
+        env_overrides.update(
+            {
+                "BENCH_STEP_LOAD": "1",
+                "BENCH_STEP_USERS": str(step_users),
+                "BENCH_STEP_SECONDS": str(parse_timespan(step_time)),
+                "BENCH_STEP_SPAWN_RATE": str(effective_spawn_rate),
+                "BENCH_MAX_USERS": str(effective_users),
+                "BENCH_RUN_TIME_SECONDS": str(parse_timespan(effective_run_time)),
+            }
+        )
     proc_env = {**os.environ, **env_overrides}
     csv_prefix = str(out_dir / "locust")
-    cmd = [
-        sys.executable,
-        "-m",
-        "locust",
-        "-f",
-        str(Path(__file__).resolve().parent / "locustfile.py"),
-        "--headless",
-        "-u",
-        str(effective_users),
-        "-r",
-        str(effective_spawn_rate),
-        "-t",
-        effective_run_time,
-        "--csv",
-        csv_prefix,
-        "--csv-full-history",
-    ]
-    locust_result = subprocess.run(cmd, env=proc_env)
-    if locust_result.returncode != 0:
+    locustfile_path = str(Path(__file__).resolve().parent / "locustfile.py")
+
+    if step_load:
+        # Locust ignores -u/-r/-t once a LoadTestShape is defined -- the shape
+        # class itself (via BENCH_RUN_TIME_SECONDS) enforces the duration cap.
+        load_flags = []
+    else:
+        load_flags = ["-u", str(effective_users), "-r", str(effective_spawn_rate), "-t", effective_run_time]
+
+    locust_result, worker_results = _run_locust(
+        locustfile_path, load_flags, csv_prefix, proc_env, workers
+    )
+    if locust_result != 0 or any(r != 0 for r in worker_results):
         # Locust exits non-zero whenever any request failed during the run (e.g. a
-        # tier hit a real limit like a storage quota or connection cap mid-run).
-        # That's a meaningful benchmark result, not a fatal error -- keep going so
+        # tier hit a real limit like a storage quota or connection cap mid-run --
+        # exactly the "push to failure" signal we want for M30). That's a
+        # meaningful benchmark result, not a fatal error -- keep going so
         # atlas_metrics.json/run_metadata.json still get written for this run.
         print(
-            f"  WARNING: Locust exited with code {locust_result.returncode} for "
+            f"  WARNING: Locust exited non-zero (master={locust_result}, workers={worker_results}) for "
             f"[{profile} / {tier_label}] (some requests failed -- see "
             f"{csv_prefix}_failures.csv). Continuing to capture metrics/metadata."
         )
@@ -155,7 +216,10 @@ def run_tier(
         "run_time": effective_run_time,
         "run_start": run_start.isoformat(),
         "run_end": run_end.isoformat(),
-        "locust_exit_code": locust_result.returncode,
+        "locust_master_exit_code": locust_result,
+        "locust_worker_exit_codes": worker_results,
+        "workers": workers,
+        "step_load": step_load,
     }
     with open(out_dir / "run_metadata.json", "w") as f:
         json.dump(run_metadata, f, indent=2)
@@ -166,7 +230,7 @@ def run_tier(
         "profile": profile,
         "tier_label": tier_label,
         "out_dir": out_dir,
-        "locust_exit_code": locust_result.returncode,
+        "locust_exit_code": locust_result,
         "atlas_metrics_available": metrics.get("available", False),
     }
 
@@ -227,10 +291,31 @@ def main() -> None:
         default=None,
         help="A tier_label (e.g. M10), a comma-separated subset (e.g. FLEX,M10,M30), or omit for every tier in tiers.yaml",
     )
-    parser.add_argument("--users", type=int, default=None, help="Override Locust user count for every run")
+    parser.add_argument("--users", type=int, default=None, help="Override Locust user count for every run (with --step-load, this is the ceiling it steps up to)")
     parser.add_argument("--spawn-rate", type=int, default=None)
     parser.add_argument("--run-time", default=None, help='e.g. "5m", "1h"')
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Run Locust as a local master + N worker processes (distributed mode on localhost) instead of one process. Use >1 to generate enough load to stress M10/M30.",
+    )
+    parser.add_argument(
+        "--step-load",
+        action="store_true",
+        help="Ramp users up in steps (via Locust's --step-load) instead of spawning straight to --users, to find the point where a tier starts failing.",
+    )
+    parser.add_argument("--step-users", type=int, default=None, help="Users to add per step (required with --step-load)")
+    parser.add_argument("--step-time", default=None, help='Time per step, e.g. "1m" (required with --step-load)')
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="After all runs finish, generate per-profile + cross-workload reports (same as running benchmarks.report).",
+    )
     args = parser.parse_args()
+
+    if args.step_load and (args.step_users is None or args.step_time is None):
+        raise SystemExit("--step-load requires both --step-users and --step-time")
 
     if args.profile:
         profiles = [p.strip() for p in args.profile.split(",") if p.strip()]
@@ -255,8 +340,8 @@ def main() -> None:
     print(f"Running profiles {profiles} against tiers {[t['tier_label'] for t in tiers]} at volume '{volume_label}'")
 
     run_results = []
-    for profile in profiles:
-        for tier in tiers:
+    for tier in tiers:
+        for profile in profiles:
             result = run_tier(
                 profile,
                 volume_label,
@@ -266,10 +351,27 @@ def main() -> None:
                 args.users,
                 args.spawn_rate,
                 args.run_time,
+                workers=args.workers,
+                step_load=args.step_load,
+                step_users=args.step_users,
+                step_time=args.step_time,
             )
             run_results.append(result)
 
     print_summary(run_results)
+
+    if args.report:
+        tier_labels = [t["tier_label"] for t in tiers]
+        print("\n=== generating reports ===")
+        for profile in profiles:
+            subprocess.run(
+                [sys.executable, "-m", "benchmarks.report", "--profile", profile, "--volume", volume_label],
+                check=False,
+            )
+        subprocess.run(
+            [sys.executable, "-m", "benchmarks.report", "--cross-workload", "--volume", volume_label, "--tiers", *tier_labels],
+            check=False,
+        )
 
 
 if __name__ == "__main__":

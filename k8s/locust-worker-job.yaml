@@ -1,0 +1,44 @@
+# The pods that actually generate load: each is a separate OS process
+# running the same locustfile.py, connecting directly to Atlas with the
+# real BENCH_MONGO_URI secret. See the "distributed mode" note in
+# benchmarks/locustfile.py for why each worker safely allocates its own,
+# non-colliding range of seq values without needing to coordinate with the
+# others -- this is what makes it safe to just change `parallelism`.
+#
+# A Job (not a Deployment) because a worker's locust process exits on its
+# own once the master shuts down at the end of a headless run -- a
+# Deployment would see that as a crash and restart it forever.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: locust-worker
+  labels:
+    app: locust
+    role: worker
+spec:
+  parallelism: 4
+  completions: 4
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: locust
+        role: worker
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: locust-worker
+          image: locust-mongo-bench:latest  # replace with your pushed image, e.g. gcr.io/<project>/locust-mongo-bench:latest
+          args: ["--worker", "--master-host=locust-master"]
+          envFrom:
+            - configMapRef:
+                name: locust-config
+            - secretRef:
+                name: locust-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"

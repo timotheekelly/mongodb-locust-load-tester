@@ -1,0 +1,76 @@
+# Runs Locust in --master mode: coordinates the worker Job's pods and (in
+# headless mode) drives the run start-to-finish on its own, then exits.
+# The master itself never executes tasks, so it doesn't need real Atlas
+# credentials -- BENCH_MONGO_URI is passed through only because
+# locustfile.py's module-level config loading requires *a* value to import
+# cleanly.
+#
+# A Job (not a Deployment): in headless mode the master process exits once
+# LOCUST_RUN_TIME elapses (or the step-load shape ends the run) -- a
+# Deployment would restart it in a crash loop instead of letting it finish.
+# restartPolicy: Never + backoffLimit: 0 means a real failure surfaces as a
+# Failed Job instead of being silently retried.
+#
+# Results (CSVs) are written to an emptyDir so `kubectl cp` can pull them
+# out of the pod -- but `kubectl cp` works by `exec`-ing a tar into the
+# container, which only works while it's still Running. A plain
+# `python -m locust --master` container exits (and the pod moves to
+# Succeeded/Failed, no more exec) the instant the run finishes, which is too
+# fast for orchestrator_k8s.py to reliably copy results out. So `command`
+# below overrides the image's entrypoint to run Locust, record its exit
+# code, then idle in `sleep` -- keeping the container alive long enough for
+# the results to be copied out before the Job is deleted (which kills the
+# sleeping pod immediately, no need to wait out the sleep).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: locust-master
+  labels:
+    app: locust
+    role: master
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: locust
+        role: master
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: locust-master
+          image: locust-mongo-bench:latest  # replace with your pushed image, e.g. gcr.io/<project>/locust-mongo-bench:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              python -m locust -f benchmarks/locustfile.py --master;
+              echo $? > /results/.exit_code;
+              sleep 600
+          env:
+            - name: LOCUST_CSV
+              value: "/results/locust"
+            - name: LOCUST_CSV_FULL_HISTORY
+              value: "true"
+          ports:
+            - name: comm
+              containerPort: 5557
+            - name: comm-plus-1
+              containerPort: 5558
+          envFrom:
+            - configMapRef:
+                name: locust-config
+            - secretRef:
+                name: locust-secrets
+          volumeMounts:
+            - name: results
+              mountPath: /results
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+      volumes:
+        - name: results
+          emptyDir: {}

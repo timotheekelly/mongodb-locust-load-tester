@@ -1,0 +1,10 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+results/
+reports/
+.env
+.claude/
+terraform/
+k8s/

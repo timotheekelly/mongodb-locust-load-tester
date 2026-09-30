@@ -36,12 +36,16 @@ benchmarks/
   config.py                    base + profile + env var config loader
   locustfile.py                the actual Locust test (standalone, self-seeding)
   seed.py                      optional: pre-seed a collection to an exact target data volume
-  orchestrator.py              optional: seed + run + summarize across profiles/tiers
+  orchestrator.py              optional: seed + run + summarize across profiles/tiers, locally
+  orchestrator_k8s.py          optional: same, but runs Locust as Jobs on a real GKE cluster
   metrics_atlas.py             optional: pulls CPU/RAM/IOPS from the Atlas Admin API
   report.py                    optional: turns results/ into charts + a markdown report
   tui.py                       optional: Textual TUI for picking profiles/tiers and running the orchestrator
 results/<profile>/<volume>/<tier>/   Locust CSVs + atlas_metrics.json + run_metadata.json per run
 reports/                             generated charts + markdown reports (optional, from report.py)
+Dockerfile                           image for locust-master/locust-worker pods (optional, for GKE)
+k8s/                                 optional: distributed Locust on GKE (master/worker Jobs + Service)
+terraform/                           optional: provisions real M0/Flex/M10/M30 Atlas clusters
 ```
 
 ## Setup
@@ -282,6 +286,116 @@ wrapper: under the hood it builds and runs the exact same
 `python -m benchmarks.orchestrator ...` command line, so behavior always
 matches the CLI. Needs the same env setup as everything else — `.env`
 sourced and `SSL_CERT_FILE` set in the shell you launch it from.
+
+## Distributed load testing on GKE
+
+For load beyond what one machine can generate — chiefly, pushing M10/M30 to
+their actual breaking point — `k8s/` runs Locust master/worker across a GKE
+cluster, driven by `benchmarks.orchestrator_k8s` so the same seed → run →
+pull-Atlas-metrics → report flow as the local orchestrator still applies,
+just with the Locust run itself happening in the cluster.
+
+```
+GKE
+  locust-master Job  (1 pod)  -- coordinates workers; in headless mode, runs the
+                                  test start-to-finish on its own, then exits
+  locust-worker Job  (N pods) -- each a full Locust worker, connects to Atlas directly
+  locust-master Service       -- ClusterIP: 5557/5558 (worker coordination only)
+```
+
+**Jobs, not Deployments**: a headless Locust run exits when it's done —
+master when the run finishes, workers when the master shuts down. A
+`Deployment` would see that as a crash and restart the pod in a loop; a
+`Job` (`restartPolicy: Never`) just lets it finish. `orchestrator_k8s.py`
+applies fresh master/worker Jobs per (tier, profile) run and tears them down
+afterward, since a Job's pod template is immutable once created — you can't
+just re-apply one in place to start the next run.
+
+**Build and push the image** (replace with your own registry):
+
+```bash
+docker build -t gcr.io/<your-project>/locust-mongo-bench:latest .
+docker push gcr.io/<your-project>/locust-mongo-bench:latest
+```
+
+**Point kubectl at your cluster** (`kubectl config current-context` should
+show it), then run the same tier/profile matrix as the local orchestrator,
+using real in-cluster worker pods instead of local processes:
+
+```bash
+# same env vars orchestrator.py already reads (M0_MONGO_URI, etc.) --
+# orchestrator_k8s.py creates/updates the in-cluster Secret from these
+# directly, nothing extra needs to go in k8s/secret.yaml
+export M0_MONGO_URI="mongodb+srv://..."
+
+.venv/bin/python -m benchmarks.orchestrator_k8s \
+    --image gcr.io/<your-project>/locust-mongo-bench:latest \
+    --profile read_heavy --volume small --tier M0 --workers 4 --report
+```
+
+**Push M30 to failure** the same way as the local `--step-load` flag (see
+above), just with real cluster-scale worker pods generating the load:
+
+```bash
+.venv/bin/python -m benchmarks.orchestrator_k8s \
+    --image gcr.io/<your-project>/locust-mongo-bench:latest \
+    --tier M30 --workers 8 \
+    --step-load --step-users 100 --step-time 1m --users 20000 --run-time 60m --report
+```
+
+Results (CSVs, `atlas_metrics.json`, `run_metadata.json`) land in
+`results/<profile>/<volume>/<tier>/`, same layout as local runs — this
+script `kubectl cp`s them out of the master pod before deleting its Job.
+
+Want to drive a run manually instead (start/stop swarms by hand, watch
+stats live)? Apply `k8s/configmap.yaml`, `locust-secrets` (see
+`k8s/secret.yaml.example`), and the Job manifests yourself, then
+`kubectl port-forward svc/locust-master 8089:8089` and open
+`http://localhost:8089` — the web UI isn't exposed externally by default
+since headless automated runs don't use it, but Locust's `--master` mode
+still serves it in-cluster.
+
+**Why scaling worker count is safe**: each worker pod is a separate OS
+process with no shared memory, so the usual "one shared counter picks the
+next `seq`" approach would let two workers allocate the same value and
+collide on the unique index. `locustfile.py`'s `BenchUser` avoids this by
+having each process claim a random, effectively-unique range for its own
+inserts at startup, while all processes share the same *read* range (the
+data that existed when they started) without needing any coordination at
+all — see the comment in `benchmarks/locustfile.py` for the full
+explanation.
+
+## Provisioning Atlas with Terraform
+
+`terraform/` provisions one real cluster per tier (M0, Flex, M10, M30) via
+the official `mongodbatlas_advanced_cluster` resource, so "spin up the
+comparison environment" is one `terraform apply` instead of four manual
+cluster creations in the Atlas UI.
+
+```bash
+export MONGODB_ATLAS_PUBLIC_API_KEY=...
+export MONGODB_ATLAS_PRIVATE_API_KEY=...
+
+cd terraform
+terraform init
+terraform plan -var="atlas_project_id=<your project id>"
+terraform apply -var="atlas_project_id=<your project id>"
+```
+
+By default this creates clusters named `tf-bench-m0`, `tf-bench-flex`,
+`tf-bench-m10`, `tf-bench-m30` — deliberately *not* `benchmark-m0` etc., so
+it won't collide with clusters you may have already created by hand in the
+same project. Override `cluster_name_prefix` (or `region_name`) via
+`-var` if you want different names/region. If you'd rather have Terraform
+manage clusters you already created manually, `terraform import` them
+first instead of applying fresh.
+
+`terraform apply` provisions real, billable infrastructure (M10/M30 are not
+free) — review the plan output before confirming. `terraform output` after
+apply prints each cluster's connection string (`terraform output
+m0_connection_string`, etc. -- marked sensitive, so pass `-raw` to see the
+value); copy those into `.env` alongside a real database user's
+credentials, same as any other tier.
 
 ## Workload profiles
 

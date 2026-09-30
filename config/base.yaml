@@ -36,8 +36,8 @@ weights:
 
 # Locust runtime (used by orchestrator when invoking locust headless)
 locust:
-  users: 10
-  spawn_rate: 5
+  users: 1000
+  spawn_rate: 50
   run_time: "5m"
 
 # Tier storage/connection limits (safety checks in orchestrator.py)
@@ -49,15 +49,15 @@ tier_testing_limits:
   FLEX:
     max_storage_bytes: 5368709120      # 5 GiB conservative test cap
     max_connections: 500
-    default_users: 10
+    default_users: 1000
   M10:
     max_storage_bytes: null
     max_connections: 1500
-    default_users: 20
+    default_users: 1000
   M30:
     max_storage_bytes: null
     max_connections: 3000
-    default_users: 50
+    default_users: 1000
 
 # Named volume presets (bytes)
 volume_presets:

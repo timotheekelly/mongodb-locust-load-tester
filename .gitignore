@@ -7,3 +7,8 @@ reports/*/
 !reports/.gitkeep
 .env
 .claude/
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/*.tfvars
+k8s/secret.yaml

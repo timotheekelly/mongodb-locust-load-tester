@@ -1,0 +1,33 @@
+# Non-secret run configuration, shared by the master and worker Jobs.
+# Edited per (tier, profile) run by k8s/run-tier.sh -- don't hand-edit while
+# a run is in flight; the driver script does `kubectl apply` on a fresh copy
+# of this before starting each run.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: locust-config
+data:
+  BENCH_PROFILE: "read_heavy"       # read_heavy | balanced | cpu_intensive
+  BENCH_DATABASE: "bench"
+  BENCH_COLLECTION: "docs"
+
+  # Master/worker coordination + fixed-load run. LOCUST_HEADLESS is required --
+  # without it the master starts the web UI and waits forever instead of
+  # auto-running (this was missing before and silently no-opped every run).
+  LOCUST_HEADLESS: "true"
+  LOCUST_EXPECT_WORKERS: "4"
+  LOCUST_USERS: "200"
+  LOCUST_SPAWN_RATE: "20"
+  LOCUST_RUN_TIME: "5m"
+
+  # Step-load (ramp-to-failure) run, e.g. for pushing M30 to its breaking
+  # point. Set BENCH_STEP_LOAD=true and run-tier.sh's --step-load flag to
+  # activate the LoadTestShape in benchmarks/locustfile.py -- this makes
+  # Locust ignore LOCUST_USERS/LOCUST_RUN_TIME above (same as locally), so
+  # BENCH_MAX_USERS/BENCH_RUN_TIME_SECONDS take over as the ceiling/cap.
+  BENCH_STEP_LOAD: "false"
+  BENCH_STEP_USERS: "50"
+  BENCH_STEP_SECONDS: "60"
+  BENCH_STEP_SPAWN_RATE: "10"
+  BENCH_MAX_USERS: "5000"
+  BENCH_RUN_TIME_SECONDS: "1800"

@@ -1,0 +1,22 @@
+# ClusterIP (not LoadBalancer): workers only need to reach the master by the
+# in-cluster DNS name "locust-master" on the coordination ports. Headless
+# runs don't use Locust's web UI, so there's no need to pay for (and wait
+# on) a real external LoadBalancer IP -- if you want the web UI for a manual
+# interactive run, use `kubectl port-forward svc/locust-master 8089:8089`
+# instead of exposing it externally.
+apiVersion: v1
+kind: Service
+metadata:
+  name: locust-master
+spec:
+  type: ClusterIP
+  selector:
+    app: locust
+    role: master
+  ports:
+    - name: comm
+      port: 5557
+      targetPort: 5557
+    - name: comm-plus-1
+      port: 5558
+      targetPort: 5558
