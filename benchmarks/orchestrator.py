@@ -28,6 +28,12 @@ Usage:
     # push a tier to failure: ramp up 50 users every minute until it breaks
     python -m benchmarks.orchestrator --tier M30 --workers 8 --users 5000 \\
         --step-load --step-users 50 --step-time 1m --run-time 30m --report
+
+    # find the saturation knee: hold each offered req/s for 2 minutes, then
+    # step to the next -- see benchmarks/analyze_saturation.py for the table
+    python -m benchmarks.orchestrator --tier M30 --workers 8 \\
+        --offered-load-stages 100,500,1000,2000,3000,5000,7500,10000,15000 \\
+        --offered-load-stage-time 2m --report
 """
 
 import argparse
@@ -124,6 +130,9 @@ def run_tier(
     step_load: bool = False,
     step_users: int | None = None,
     step_time: str | None = None,
+    offered_load_stages: list[int] | None = None,
+    offered_load_stage_time: str | None = None,
+    offered_load_spawn_rate: int | None = None,
 ) -> dict:
     """Reseed + run one (profile, tier) combination. Returns a small summary
     dict describing what happened, for the final consolidated printout."""
@@ -151,12 +160,28 @@ def run_tier(
     print(f"\n=== [{profile} / {tier_label}] reseeding to {target_volume_bytes / 1024**3:.2f}GB ===")
     seed.seed(cfg, target_volume_bytes, tier_label=tier_label)
 
-    load_desc = f"{effective_users} users" if not step_load else f"stepping to {effective_users} users, +{step_users}/{step_time}"
+    if offered_load_stages:
+        load_desc = f"offered-load sweep {offered_load_stages} req/s, {offered_load_stage_time}/stage"
+    elif step_load:
+        load_desc = f"stepping to {effective_users} users, +{step_users}/{step_time}"
+    else:
+        load_desc = f"{effective_users} users"
     print(f"=== [{profile} / {tier_label}] running Locust ({load_desc}, {workers} worker(s), {effective_run_time}) ===")
     run_start = datetime.now(timezone.utc)
 
     env_overrides = {"BENCH_PROFILE": profile, "BENCH_MONGO_URI": mongo_uri}
-    if step_load:
+    if offered_load_stages:
+        # Saturation sweep: hold each fixed offered req/s for a while, then
+        # step to the next -- see OfferedLoadShape in locustfile.py.
+        env_overrides.update(
+            {
+                "BENCH_OFFERED_LOAD": "1",
+                "BENCH_OFFERED_LOAD_STAGES": ",".join(str(s) for s in offered_load_stages),
+                "BENCH_OFFERED_LOAD_STAGE_SECONDS": str(parse_timespan(offered_load_stage_time)),
+                "BENCH_OFFERED_LOAD_SPAWN_RATE": str(offered_load_spawn_rate or 20),
+            }
+        )
+    elif step_load:
         # Locust's CLI dropped --step-load; ramping is done via a LoadTestShape
         # class in locustfile.py that only activates when BENCH_STEP_LOAD is set.
         env_overrides.update(
@@ -173,9 +198,10 @@ def run_tier(
     csv_prefix = str(out_dir / "locust")
     locustfile_path = str(Path(__file__).resolve().parent / "locustfile.py")
 
-    if step_load:
+    if offered_load_stages or step_load:
         # Locust ignores -u/-r/-t once a LoadTestShape is defined -- the shape
-        # class itself (via BENCH_RUN_TIME_SECONDS) enforces the duration cap.
+        # class itself enforces the duration cap (OfferedLoadShape stops on
+        # its own once stages run out; StepLoadShape via BENCH_RUN_TIME_SECONDS).
         load_flags = []
     else:
         load_flags = ["-u", str(effective_users), "-r", str(effective_spawn_rate), "-t", effective_run_time]
@@ -220,6 +246,8 @@ def run_tier(
         "locust_worker_exit_codes": worker_results,
         "workers": workers,
         "step_load": step_load,
+        "offered_load_stages": offered_load_stages,
+        "offered_load_stage_seconds": parse_timespan(offered_load_stage_time) if offered_load_stages else None,
     }
     with open(out_dir / "run_metadata.json", "w") as f:
         json.dump(run_metadata, f, indent=2)
@@ -308,6 +336,28 @@ def main() -> None:
     parser.add_argument("--step-users", type=int, default=None, help="Users to add per step (required with --step-load)")
     parser.add_argument("--step-time", default=None, help='Time per step, e.g. "1m" (required with --step-load)')
     parser.add_argument(
+        "--offered-load-stages",
+        default=None,
+        help=(
+            "Saturation sweep: comma-separated offered req/s to hold in sequence, e.g. "
+            "\"100,500,1000,2000,3000,5000,7500,10000,15000\". Each user self-paces to ~1 req/s, "
+            "so this finds the throughput/latency knee instead of just reporting one load level. "
+            "Analyze with: python -m benchmarks.analyze_saturation"
+        ),
+    )
+    parser.add_argument("--offered-load-stage-time", default="60s", help="How long to hold each offered-load stage, e.g. \"60s\", \"2m\" (needs >=60s for Atlas metrics granularity to resolve each stage)")
+    parser.add_argument(
+        "--offered-load-spawn-rate",
+        type=int,
+        default=20,
+        help=(
+            "Users ramped per second at each stage transition in an offered-load sweep. Keep this low (default 20) -- "
+            "MongoDBUser opens a fresh MongoClient per simulated user, so a high spawn rate means a burst of new "
+            "TLS/SRV connections hitting the load generator's own CPU all at once, which can look like (or even cause) "
+            "a MongoDB-side latency spike that isn't real."
+        ),
+    )
+    parser.add_argument(
         "--report",
         action="store_true",
         help="After all runs finish, generate per-profile + cross-workload reports (same as running benchmarks.report).",
@@ -316,6 +366,12 @@ def main() -> None:
 
     if args.step_load and (args.step_users is None or args.step_time is None):
         raise SystemExit("--step-load requires both --step-users and --step-time")
+    if args.step_load and args.offered_load_stages:
+        raise SystemExit("--step-load and --offered-load-stages are mutually exclusive (they're two different LoadTestShapes)")
+
+    offered_load_stages = None
+    if args.offered_load_stages:
+        offered_load_stages = [int(s.strip()) for s in args.offered_load_stages.split(",") if s.strip()]
 
     if args.profile:
         profiles = [p.strip() for p in args.profile.split(",") if p.strip()]
@@ -355,6 +411,9 @@ def main() -> None:
                 step_load=args.step_load,
                 step_users=args.step_users,
                 step_time=args.step_time,
+                offered_load_stages=offered_load_stages,
+                offered_load_stage_time=args.offered_load_stage_time,
+                offered_load_spawn_rate=args.offered_load_spawn_rate,
             )
             run_results.append(result)
 

@@ -24,6 +24,12 @@ Usage:
     # push M30 to failure: ramp up over the cluster, 8 workers
     python -m benchmarks.orchestrator_k8s --tier M30 --volume small --workers 8 \\
         --step-load --step-users 100 --step-time 1m --users 20000 --run-time 60m --report
+
+    # find the saturation knee instead: hold each offered req/s for 2 minutes
+    python -m benchmarks.orchestrator_k8s --tier M30 --volume small --workers 8 \\
+        --offered-load-stages 100,500,1000,2000,3000,5000,7500,10000,15000 \\
+        --offered-load-stage-time 2m --master-wait-timeout 2400 --report
+    # then: python -m benchmarks.analyze_saturation --profile read_heavy --volume small --tier M30
 """
 
 import argparse
@@ -104,6 +110,9 @@ def _apply_configmap(
     step_load: bool,
     step_users: int | None,
     step_time: str | None,
+    offered_load_stages: list[int] | None,
+    offered_load_stage_time: str | None,
+    offered_load_spawn_rate: int | None,
     namespace: str,
 ) -> None:
     data = {
@@ -113,7 +122,17 @@ def _apply_configmap(
         "LOCUST_HEADLESS": "true",
         "LOCUST_EXPECT_WORKERS": str(workers),
     }
-    if step_load:
+    if offered_load_stages:
+        data.update(
+            {
+                "BENCH_OFFERED_LOAD": "true",
+                "BENCH_OFFERED_LOAD_STAGES": ",".join(str(s) for s in offered_load_stages),
+                "BENCH_OFFERED_LOAD_STAGE_SECONDS": str(parse_timespan(offered_load_stage_time)),
+                "BENCH_OFFERED_LOAD_SPAWN_RATE": str(offered_load_spawn_rate or 20),
+                "BENCH_STEP_LOAD": "false",
+            }
+        )
+    elif step_load:
         data.update(
             {
                 "BENCH_STEP_LOAD": "true",
@@ -143,6 +162,16 @@ def _apply_configmap(
         {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "locust-config"}, "data": data},
         namespace,
     )
+
+
+def _apply_service(namespace: str) -> None:
+    """Workers connect to the master by the DNS name "locust-master"
+    (--master-host=locust-master in locust-worker-job.yaml) -- that name only
+    exists once this Service is applied. Without it workers just retry the
+    connection forever and the master sits at "0 of N connected" until the
+    wait timeout gives up."""
+    service = yaml.safe_load((K8S_DIR / "locust-master-service.yaml").read_text())
+    _kubectl_apply_yaml(service, namespace)
 
 
 def _apply_jobs(workers: int, image: str, namespace: str) -> None:
@@ -189,6 +218,37 @@ def _wait_for_master(namespace: str, timeout_seconds: int) -> str:
     return "timeout"
 
 
+def _dump_debug_info(namespace: str, out_dir: Path) -> None:
+    """Capture pod/job state before anything gets torn down. Without this, a
+    failed run (ImagePullBackOff, Pending/unschedulable, OOMKilled, etc.) is
+    impossible to diagnose after the fact: _delete_jobs() runs right after
+    this regardless of outcome, which deletes the only evidence."""
+    sections = []
+    for args in (
+        ["get", "pods", "-l", "app=locust", "-o", "wide"],
+        ["get", "jobs"],
+        ["describe", "job", MASTER_JOB_NAME],
+        ["describe", "job", WORKER_JOB_NAME],
+        ["get", "events", "--sort-by=.lastTimestamp"],
+    ):
+        result = _kubectl(*args, namespace=namespace, check=False)
+        sections.append(f"$ kubectl {' '.join(args)}\n{result.stdout}\n{result.stderr}")
+
+    pods_result = _kubectl(
+        "get", "pods", "-l", "app=locust", "-o", "jsonpath={.items[*].metadata.name}",
+        namespace=namespace, check=False,
+    )
+    for pod_name in pods_result.stdout.split():
+        describe = _kubectl("describe", "pod", pod_name, namespace=namespace, check=False)
+        sections.append(f"$ kubectl describe pod {pod_name}\n{describe.stdout}\n{describe.stderr}")
+        logs = _kubectl("logs", pod_name, "--all-containers=true", namespace=namespace, check=False)
+        sections.append(f"$ kubectl logs {pod_name}\n{logs.stdout}\n{logs.stderr}")
+
+    debug_path = out_dir / "k8s_debug.txt"
+    debug_path.write_text("\n\n".join(sections))
+    print(f"  Captured pod/job diagnostics to {debug_path} before cleanup")
+
+
 def _copy_results(namespace: str, out_dir: Path) -> None:
     pod_name = _master_pod_name(namespace)
     if pod_name is None:
@@ -217,6 +277,9 @@ def run_tier_k8s(
     namespace: str,
     master_wait_timeout: int,
     skip_seed: bool = False,
+    offered_load_stages: list[int] | None = None,
+    offered_load_stage_time: str | None = None,
+    offered_load_spawn_rate: int | None = None,
 ) -> dict:
     tier_label = tier["tier_label"]
     mongo_uri = _resolve_env(tier["mongo_uri_env"], f"tier {tier_label} mongo URI")
@@ -244,20 +307,39 @@ def run_tier_k8s(
     print(f"=== [{profile} / {tier_label}] (k8s) clearing any leftover Jobs ===")
     _delete_jobs(namespace)
 
-    print(f"=== [{profile} / {tier_label}] (k8s) applying secret/config/jobs ({workers} worker pods) ===")
+    print(f"=== [{profile} / {tier_label}] (k8s) applying service/secret/config/jobs ({workers} worker pods) ===")
+    _apply_service(namespace)
     _apply_secret(mongo_uri, namespace)
     _apply_configmap(
         profile, image, workers, effective_users, effective_spawn_rate, effective_run_time,
-        step_load, step_users, step_time, namespace,
+        step_load, step_users, step_time, offered_load_stages, offered_load_stage_time,
+        offered_load_spawn_rate, namespace,
     )
     run_start = datetime.now(timezone.utc)
     _apply_jobs(workers, image, namespace)
 
     print(f"=== [{profile} / {tier_label}] (k8s) waiting for master Job to finish (timeout {master_wait_timeout}s) ===")
     outcome = _wait_for_master(namespace, master_wait_timeout)
-    if outcome != "complete":
-        print(f"  WARNING: master Job ended with '{outcome}' for [{profile} / {tier_label}] -- see `kubectl logs job/{MASTER_JOB_NAME}`")
     run_end = datetime.now(timezone.utc)
+    elapsed_seconds = (run_end - run_start).total_seconds()
+
+    expected_seconds = None
+    if offered_load_stages:
+        expected_seconds = len(offered_load_stages) * parse_timespan(offered_load_stage_time)
+    elif step_load:
+        expected_seconds = parse_timespan(effective_run_time)
+    ended_early = expected_seconds is not None and elapsed_seconds < 0.8 * expected_seconds
+
+    if outcome != "complete":
+        print(f"  WARNING: master Job ended with '{outcome}' for [{profile} / {tier_label}] -- dumping diagnostics before cleanup")
+        _dump_debug_info(namespace, out_dir)
+    elif ended_early:
+        print(
+            f"  WARNING: master Job reported 'complete' but only ran {elapsed_seconds:.0f}s of an expected "
+            f"~{expected_seconds}s -- likely stopped early (e.g. lost workers under load), not a clean finish. "
+            "Dumping diagnostics before cleanup."
+        )
+        _dump_debug_info(namespace, out_dir)
 
     print(f"=== [{profile} / {tier_label}] (k8s) copying results out of the master pod ===")
     _copy_results(namespace, out_dir)
@@ -282,8 +364,11 @@ def run_tier_k8s(
         "run_end": run_end.isoformat(),
         "workers": workers,
         "step_load": step_load,
+        "offered_load_stages": offered_load_stages,
+        "offered_load_stage_seconds": parse_timespan(offered_load_stage_time) if offered_load_stages else None,
         "backend": "gke",
         "master_job_outcome": outcome,
+        "ended_early": ended_early,
     }
     with open(out_dir / "run_metadata.json", "w") as f:
         json.dump(run_metadata, f, indent=2)
@@ -337,6 +422,26 @@ def main() -> None:
     parser.add_argument("--step-load", action="store_true")
     parser.add_argument("--step-users", type=int, default=None)
     parser.add_argument("--step-time", default=None)
+    parser.add_argument(
+        "--offered-load-stages",
+        default=None,
+        help=(
+            "Saturation sweep: comma-separated offered req/s to hold in sequence, e.g. "
+            "\"100,500,1000,2000,3000,5000,7500,10000,15000\". Analyze with: "
+            "python -m benchmarks.analyze_saturation"
+        ),
+    )
+    parser.add_argument("--offered-load-stage-time", default="60s", help='How long to hold each stage, e.g. "60s", "2m"')
+    parser.add_argument(
+        "--offered-load-spawn-rate",
+        type=int,
+        default=20,
+        help=(
+            "Users ramped per second at each stage transition. Keep this low (default 20) -- MongoDBUser opens a "
+            "fresh MongoClient per simulated user, so a high spawn rate bursts many new TLS/SRV connections onto "
+            "the worker pod's own CPU at once, which can look like (or cause) a false MongoDB-side latency spike."
+        ),
+    )
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--namespace", default="default")
     parser.add_argument(
@@ -344,12 +449,18 @@ def main() -> None:
         required=True,
         help="Image reference your GKE cluster can pull, e.g. gcr.io/<project>/locust-mongo-bench:latest",
     )
-    parser.add_argument("--master-wait-timeout", type=int, default=3600, help="Seconds to wait for the master Job to finish")
+    parser.add_argument("--master-wait-timeout", type=int, default=3600, help="Seconds to wait for the master Job to finish -- make sure this comfortably exceeds the total sweep/step-load duration")
     parser.add_argument("--skip-seed", action="store_true", help="Don't reseed the collection before running (e.g. it's already seeded from a prior run)")
     args = parser.parse_args()
 
     if args.step_load and (args.step_users is None or args.step_time is None):
         raise SystemExit("--step-load requires both --step-users and --step-time")
+    if args.step_load and args.offered_load_stages:
+        raise SystemExit("--step-load and --offered-load-stages are mutually exclusive (they're two different LoadTestShapes)")
+
+    offered_load_stages = None
+    if args.offered_load_stages:
+        offered_load_stages = [int(s.strip()) for s in args.offered_load_stages.split(",") if s.strip()]
 
     if args.profile:
         profiles = [p.strip() for p in args.profile.split(",") if p.strip()]
@@ -384,6 +495,9 @@ def main() -> None:
                 args.workers, args.step_load, args.step_users, args.step_time,
                 args.image, args.namespace, args.master_wait_timeout,
                 skip_seed=args.skip_seed,
+                offered_load_stages=offered_load_stages,
+                offered_load_stage_time=args.offered_load_stage_time,
+                offered_load_spawn_rate=args.offered_load_spawn_rate,
             )
             run_results.append(result)
 

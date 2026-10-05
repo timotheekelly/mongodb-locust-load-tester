@@ -67,14 +67,26 @@ def collect_profile_data(profile: str, volume_label: str) -> dict[str, dict]:
     return data
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    """Locust writes the literal string "N/A" for percentiles on a tier with
+    zero requests (e.g. workers never connected) -- float("N/A") raises, so
+    this treats it the same as missing/empty."""
+    if value in (None, "", "N/A"):
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _chart_latency(data: dict[str, dict], out_path: Path) -> None:
     tiers = list(data.keys())
     p50, p95, p99 = [], [], []
     for tier in tiers:
         agg = (data[tier]["stats"] or {}).get("aggregated") or {}
-        p50.append(float(agg.get("50%", 0) or 0))
-        p95.append(float(agg.get("95%", 0) or 0))
-        p99.append(float(agg.get("99%", 0) or 0))
+        p50.append(_safe_float(agg.get("50%")))
+        p95.append(_safe_float(agg.get("95%")))
+        p99.append(_safe_float(agg.get("99%")))
 
     x = range(len(tiers))
     width = 0.25
@@ -97,7 +109,7 @@ def _chart_throughput(data: dict[str, dict], out_path: Path) -> None:
     throughput = []
     for tier in tiers:
         agg = (data[tier]["stats"] or {}).get("aggregated") or {}
-        throughput.append(float(agg.get("Requests/s", 0) or 0))
+        throughput.append(_safe_float(agg.get("Requests/s")))
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.bar(tiers, throughput)
@@ -194,7 +206,7 @@ def generate_cross_workload_report(volume_label: str, tiers: list[str]) -> Path:
         p99s = []
         for tier in tiers:
             agg = (per_tier[tier].get(profile, {}).get("stats") or {}).get("aggregated") or {}
-            p99s.append(float(agg.get("99%", 0) or 0))
+            p99s.append(_safe_float(agg.get("99%")))
         ax.bar([j + (i - 1) * width for j in x], p99s, width, label=profile)
     ax.set_xticks(list(x))
     ax.set_xticklabels(tiers)

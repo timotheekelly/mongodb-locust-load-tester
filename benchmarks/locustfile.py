@@ -4,7 +4,7 @@ import threading
 import time
 
 from bson import BSON
-from locust import LoadTestShape, events, task
+from locust import LoadTestShape, constant_throughput, events, task
 from locust.contrib.mongodb import MongoDBUser
 from pymongo import DESCENDING
 
@@ -82,12 +82,56 @@ if os.environ.get("BENCH_STEP_LOAD", "").lower() in ("1", "true"):
             return (users, self.spawn_rate)
 
 
+_OFFERED_LOAD = os.environ.get("BENCH_OFFERED_LOAD", "").lower() in ("1", "true")
+
+if _OFFERED_LOAD:
+    # Saturation testing: hold a fixed *offered* request rate for a while, then
+    # step up to the next one, to find the throughput/latency knee rather than
+    # just comparing average latency at one load level. Driven by
+    # benchmarks.analyze_saturation afterward, which needs stage_seconds,
+    # stages_rps, run_start (written to run_metadata.json by the orchestrator)
+    # to know which locust_stats_history.csv rows belong to which stage.
+    class OfferedLoadShape(LoadTestShape):
+        stages_rps = [int(x) for x in os.environ["BENCH_OFFERED_LOAD_STAGES"].split(",") if x.strip()]
+        stage_seconds = int(os.environ["BENCH_OFFERED_LOAD_STAGE_SECONDS"])
+        # MongoDBUser opens a brand-new MongoClient per simulated user (not
+        # shared), so a big spawn_rate means dozens-to-hundreds of fresh
+        # SRV-lookup+TLS-handshake connections firing within ~1 second at
+        # every stage transition. That's a connection-storm on the *load
+        # generator's* own CPU, not a real MongoDB bottleneck -- it can spike
+        # latency and even starve the worker pod enough to miss a heartbeat
+        # and abort the whole run early. Default to a gentle ramp instead.
+        spawn_rate = int(os.environ.get("BENCH_OFFERED_LOAD_SPAWN_RATE", 20))
+
+        def tick(self):
+            stage_idx = int(self.get_run_time() // self.stage_seconds)
+            if stage_idx >= len(self.stages_rps):
+                return None
+            # Each user self-paces to ~1 request/sec (see BenchUser.wait_time
+            # below), so "N users" directly means "N req/s offered" -- no
+            # separate per-user rate to juggle.
+            return (self.stages_rps[stage_idx], self.spawn_rate)
+
+
 class BenchUser(MongoDBUser):
     abstract = False
 
     conn_string = _CFG["mongo_uri"]
     db_name = _CFG["database"]
     collection_name = _CFG["collection"]
+
+    if _OFFERED_LOAD:
+        # Without this, a User fires its next task as soon as the previous
+        # one's response comes back (closed-loop) -- throughput is then
+        # bounded by concurrency, not by a chosen rate, which is the wrong
+        # shape for an "offered load" sweep: a saturated server just makes
+        # each User's own loop slower, instead of visibly failing to keep up
+        # with an externally-chosen arrival rate. Pacing each User to ~1
+        # req/sec regardless of response time (open-loop-ish) means
+        # offered load stays whatever OfferedLoadShape chose, and
+        # achieved throughput (Locust's own Requests/s) is the thing that
+        # can fall behind it once the cluster saturates.
+        wait_time = constant_throughput(1)
 
     # Shared across all simulated users *within this process*. In
     # distributed mode (Locust master + worker pods on GKE), each worker is

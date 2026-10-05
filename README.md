@@ -40,6 +40,7 @@ benchmarks/
   orchestrator_k8s.py          optional: same, but runs Locust as Jobs on a real GKE cluster
   metrics_atlas.py             optional: pulls CPU/RAM/IOPS from the Atlas Admin API
   report.py                    optional: turns results/ into charts + a markdown report
+  analyze_saturation.py        optional: turns an --offered-load-stages sweep into a knee-detection table + chart
   tui.py                       optional: Textual TUI for picking profiles/tiers and running the orchestrator
 results/<profile>/<volume>/<tier>/   Locust CSVs + atlas_metrics.json + run_metadata.json per run
 reports/                             generated charts + markdown reports (optional, from report.py)
@@ -272,6 +273,56 @@ tiers. The second produces
 `reports/cross_workload/small_cross_workload_report.md` comparing all
 three profiles side by side, per tier.
 
+### Finding the saturation point ("at what load does this tier stop scaling")
+
+Comparing average latency across tiers at one fixed user count answers "is
+M30 faster than M10 at 50 users" — not "what's the actual ceiling for
+either". For that you want **offered load** (requests/sec, independent of
+how slow the server gets) as the swept variable, holding each level long
+enough to reach steady state, and watching where achieved throughput stops
+tracking it:
+
+```bash
+.venv/bin/python -m benchmarks.orchestrator --tier M30 --workers 8 \
+    --offered-load-stages 100,500,1000,2000,3000,5000,7500,10000,15000 \
+    --offered-load-stage-time 2m
+
+.venv/bin/python -m benchmarks.analyze_saturation --profile read_heavy --volume small --tier M30
+```
+
+Mechanically: each simulated Locust user self-paces to ~1 request/sec
+(`constant_throughput(1)`, set only in this mode) instead of firing the next
+request the instant the last one returns — so "N users" means "N req/s
+offered" even once the server is too slow to keep up, rather than just
+making each user's own loop run slower. `--offered-load-stages` holds each
+level for `--offered-load-stage-time` (needs to be ≥60s — Atlas metrics are
+only available at 1-minute granularity) before stepping to the next.
+
+`analyze_saturation` then reads the run's `locust_stats_history.csv` (sampled
+every 5s by Locust) and `atlas_metrics.json`, buckets both by stage, and
+finds the **knee**: the first stage where achieved throughput falls below
+90% of offered, or p95 latency more than doubles versus the previous stage.
+It writes `reports/saturation/<tier>_<profile>_<volume>_saturation.md` (table
++ chart) with avg CPU%/IOPS/connections alongside each stage, so you can see
+*what* bottlenecked, not just *that* it did — e.g.:
+
+| Offered (req/s) | Achieved (req/s) | p95 (ms) | Errors | avg CPU% | avg IOPS (r/w) |
+|---:|---:|---:|---:|---:|---:|
+| 3,000 | 2,980 | 25 | 0% | 62 | 1200/800 |
+| 5,000 | 4,400 | 220 | 1% | 89 | 1900/1100 |
+| 7,500 | 4,600 **← knee** | 900 | 12% | 97 | 1950/1150 |
+
+Same flags work with `benchmarks.orchestrator_k8s` for a GKE-backed sweep —
+just make sure `--master-wait-timeout` comfortably exceeds
+`len(stages) * stage_time`.
+
+Two things worth recording alongside the result, since they change what the
+numbers mean: this reports **Locust-level requests/sec**, not raw MongoDB
+ops/sec — `bulk_insert` is one Locust request per batched `insert_many` call
+(`bulk_insert_batch_size` documents each), not one per document. And if
+you're on GCP, note whether the tier is Gen1 or Gen2 (Gen2 lets IOPS scale
+independently of storage) — it changes where the ceiling actually is.
+
 ### Optional: a TUI instead of typing flags
 
 ```bash
@@ -311,16 +362,49 @@ applies fresh master/worker Jobs per (tier, profile) run and tears them down
 afterward, since a Job's pod template is immutable once created — you can't
 just re-apply one in place to start the next run.
 
-**Build and push the image** (replace with your own registry):
+### Prerequisites
+
+- A GKE cluster, and `kubectl` pointed at it:
+  ```bash
+  gcloud container clusters get-credentials <cluster-name> --region <region> --project <project-id>
+  kubectl config current-context   # should print the gke_... context, not minikube/docker-desktop
+  ```
+  If `kubectl get nodes` errors with `executable gke-gcloud-auth-plugin not found`, install it with
+  `gcloud components install gke-gcloud-auth-plugin` and retry.
+- `SSL_CERT_FILE` set in the shell you run anything from (same requirement as everywhere else
+  in this repo that talks to Atlas directly — seeding and Atlas metrics pulls run from wherever
+  you invoke `orchestrator_k8s.py`, not inside the cluster):
+  ```bash
+  export SSL_CERT_FILE="$(.venv/bin/python -m certifi)"
+  ```
+- The tier env vars `tiers.yaml` points to (e.g. `M30_MONGO_URI`), same as local runs.
+- **If the GKE cluster and the Atlas cluster are in different regions/clouds** (e.g. GKE in
+  `europe-west1`, Atlas on AWS `us-east-1`), every request pays a real cross-region round trip —
+  this can dominate your latency numbers and look like saturation when it's actually just
+  geography. Check this before drawing conclusions from a run; ideally run the GKE cluster in (or
+  near) the Atlas cluster's own region/cloud.
+
+### Build and push the image
+
+**Container Registry (`gcr.io`) is being phased out** — new GCP projects often don't have it at
+all. Use Artifact Registry instead:
 
 ```bash
-docker build -t gcr.io/<your-project>/locust-mongo-bench:latest .
-docker push gcr.io/<your-project>/locust-mongo-bench:latest
+gcloud artifacts repositories create locust-bench --repository-format=docker --location=<region>
+gcloud auth configure-docker <region>-docker.pkg.dev
 ```
 
-**Point kubectl at your cluster** (`kubectl config current-context` should
-show it), then run the same tier/profile matrix as the local orchestrator,
-using real in-cluster worker pods instead of local processes:
+**If you're on Apple Silicon (M-series Mac), you must cross-build for amd64** — GKE nodes are
+amd64, and a plain `docker build` on an M-series Mac produces an arm64-only image. Without
+`--platform`, every pod fails with `ImagePullBackOff` / `no match for platform in manifest`:
+
+```bash
+docker build --platform linux/amd64 \
+    -t <region>-docker.pkg.dev/<project-id>/locust-bench/locust-mongo-bench:latest .
+docker push <region>-docker.pkg.dev/<project-id>/locust-bench/locust-mongo-bench:latest
+```
+
+### Run it
 
 ```bash
 # same env vars orchestrator.py already reads (M0_MONGO_URI, etc.) --
@@ -329,41 +413,90 @@ using real in-cluster worker pods instead of local processes:
 export M0_MONGO_URI="mongodb+srv://..."
 
 .venv/bin/python -m benchmarks.orchestrator_k8s \
-    --image gcr.io/<your-project>/locust-mongo-bench:latest \
+    --image <region>-docker.pkg.dev/<project-id>/locust-bench/locust-mongo-bench:latest \
     --profile read_heavy --volume small --tier M0 --workers 4 --report
 ```
 
-**Push M30 to failure** the same way as the local `--step-load` flag (see
-above), just with real cluster-scale worker pods generating the load:
+Start small on a first run against a new cluster (`--volume small`, `--tier M0`, few workers,
+short `--master-wait-timeout`) to confirm the whole pipeline works end to end before committing to
+a long `medium`/`large` sweep — reseeding especially can take far longer than the load-generation
+part itself, and you don't want to discover a config problem 40 minutes in.
+
+**Push M30 to failure** with a ramp (`--step-load`):
 
 ```bash
 .venv/bin/python -m benchmarks.orchestrator_k8s \
-    --image gcr.io/<your-project>/locust-mongo-bench:latest \
+    --image <region>-docker.pkg.dev/<project-id>/locust-bench/locust-mongo-bench:latest \
     --tier M30 --workers 8 \
     --step-load --step-users 100 --step-time 1m --users 20000 --run-time 60m --report
 ```
 
+**Or find the saturation knee** (see "Finding the saturation point" above for what this means and
+why) — note `--master-wait-timeout` needs to comfortably exceed `len(stages) * stage-time`, since
+the master won't report done until the whole sweep finishes or fails:
+
+```bash
+.venv/bin/python -m benchmarks.orchestrator_k8s \
+    --image <region>-docker.pkg.dev/<project-id>/locust-bench/locust-mongo-bench:latest \
+    --tier M30 --volume small --workers 8 \
+    --offered-load-stages 100,500,1000,2000,3000,5000,7500,10000,15000 \
+    --offered-load-stage-time 2m --master-wait-timeout 1500 --report
+
+.venv/bin/python -m benchmarks.analyze_saturation --profile read_heavy --volume small --tier M30
+```
+
+`--offered-load-spawn-rate` (default 20) controls how fast each stage ramps up to its target user
+count. Keep it low: `locust.contrib.mongodb.MongoDBUser` opens a brand-new `MongoClient` per
+simulated user (not shared), so a high spawn rate means dozens-to-hundreds of fresh TLS/SRV
+connections firing within about a second at every stage transition — a connection-storm on the
+*load generator's own* CPU, not a real MongoDB bottleneck. If you see a latency cliff with Atlas
+CPU still low, this is the first thing to suspect, not an actual tier limitation.
+
+Already seeded this tier/volume/profile from a previous attempt and just want to rerun the load
+test without re-seeding (seeding can take much longer than the run itself)? Add `--skip-seed`.
+
 Results (CSVs, `atlas_metrics.json`, `run_metadata.json`) land in
-`results/<profile>/<volume>/<tier>/`, same layout as local runs — this
-script `kubectl cp`s them out of the master pod before deleting its Job.
+`results/<profile>/<volume>/<tier>/`, same layout as local runs — this script `kubectl cp`s them
+out of the master pod before deleting its Job.
 
-Want to drive a run manually instead (start/stop swarms by hand, watch
-stats live)? Apply `k8s/configmap.yaml`, `locust-secrets` (see
-`k8s/secret.yaml.example`), and the Job manifests yourself, then
-`kubectl port-forward svc/locust-master 8089:8089` and open
-`http://localhost:8089` — the web UI isn't exposed externally by default
-since headless automated runs don't use it, but Locust's `--master` mode
-still serves it in-cluster.
+### If a run fails, times out, or finishes suspiciously fast
 
-**Why scaling worker count is safe**: each worker pod is a separate OS
-process with no shared memory, so the usual "one shared counter picks the
-next `seq`" approach would let two workers allocate the same value and
-collide on the unique index. `locustfile.py`'s `BenchUser` avoids this by
-having each process claim a random, effectively-unique range for its own
-inserts at startup, while all processes share the same *read* range (the
-data that existed when they started) without needing any coordination at
-all — see the comment in `benchmarks/locustfile.py` for the full
-explanation.
+`orchestrator_k8s.py` captures `kubectl get pods/jobs/events`, `describe pod`, and pod logs for
+master + every worker into `results/<profile>/<volume>/<tier>/k8s_debug.txt` **before** tearing
+anything down, whenever:
+- the master Job fails or times out, or
+- it reports success but ran for less than 80% of the expected sweep/ramp duration (`run_metadata.json`'s `"ended_early": true` — a clean-looking exit that actually stopped early, e.g. because the master lost too many workers mid-run).
+
+Start there instead of re-running blind. Things actually seen while building this:
+- `ImagePullBackOff` + `no match for platform in manifest` → the Apple Silicon cross-build issue above.
+- Workers stuck at `Waiting for workers to be ready, 0 of N connected` forever → the `locust-master`
+  Service wasn't applied (fixed in this repo, but if you're debugging a fork/modification, check
+  this first — workers connect to the master by that Service's DNS name).
+- `ServerSelectionTimeoutError` / `No primary available for writes` partway through a sweep → not
+  a tooling bug; this is MongoDB itself failing over (a replica set election), usually because the
+  offered load actually got large enough to destabilize the primary. Worth confirming against
+  Atlas's own Activity Feed for the cluster at that timestamp — a genuinely interesting result if
+  you were trying to find a breaking point, not an error to explain away.
+- GKE Autopilot clusters start with **zero nodes** — `kubectl get nodes` showing
+  `No resources found` right after cluster creation is normal, not broken; nodes appear once a
+  workload needs them, adding a short delay to the first run.
+
+### Driving it manually instead
+
+Want to start/stop swarms by hand and watch stats live, rather than via `orchestrator_k8s.py`?
+Apply `k8s/configmap.yaml`, `locust-secrets` (see `k8s/secret.yaml.example`), and the Job manifests
+yourself, then `kubectl port-forward svc/locust-master 8089:8089` and open
+`http://localhost:8089` — the web UI isn't exposed externally by default since headless automated
+runs don't use it, but Locust's `--master` mode still serves it in-cluster.
+
+### Why scaling worker count is safe
+
+Each worker pod is a separate OS process with no shared memory, so the usual "one shared counter
+picks the next `seq`" approach would let two workers allocate the same value and collide on the
+unique index. `locustfile.py`'s `BenchUser` avoids this by having each process claim a random,
+effectively-unique range for its own inserts at startup, while all processes share the same *read*
+range (the data that existed when they started) without needing any coordination at all — see the
+comment in `benchmarks/locustfile.py` for the full explanation.
 
 ## Provisioning Atlas with Terraform
 
