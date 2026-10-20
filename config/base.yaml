@@ -4,6 +4,19 @@
 mongo_uri: "mongodb://localhost:27017"
 database: "bench"
 collection: "docs"
+# All simulated users in one Locust process share a single MongoClient (see
+# BenchUser.__init__ in locustfile.py) -- this is that client's own pool
+# size, not a per-user value. Sized to leave headroom under a tier's real
+# connection limit when multiplied by worker-pod count (e.g. 150 * 8 pods =
+# 1200, under M10/M30's 1500 cap) while still being well above what a single
+# pod needs at modest offered loads.
+mongo_max_pool_size: 150
+# Without this, a simulated user whose turn never comes (pool exhausted at
+# high offered load) waits *indefinitely* for a free connection -- it never
+# fails, it just silently inflates response-time stats into the minutes,
+# which looks like (but isn't) MongoDB being catastrophically slow. This
+# makes pool exhaustion surface as a real, timed, countable failure instead.
+mongo_wait_queue_timeout_ms: 10000
 
 # Document shape
 doc_size_bytes: 10240         # 10 KiB default target document size (BSON-measured)

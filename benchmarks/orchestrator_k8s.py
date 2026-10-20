@@ -214,6 +214,12 @@ def _wait_for_master(namespace: str, timeout_seconds: int) -> str:
             )
             if result.returncode == 0 and result.stdout.strip():
                 return "complete" if result.stdout.strip() == "0" else "failed"
+            if result.returncode != 0:
+                # The pod we were polling may have been replaced (e.g. a
+                # backoffLimit retry after a scheduler preemption) -- re-resolve
+                # by label instead of retrying the same, possibly now-deleted,
+                # pod name forever.
+                pod_name = None
         time.sleep(5)
     return "timeout"
 

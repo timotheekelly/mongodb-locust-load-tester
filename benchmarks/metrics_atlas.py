@@ -33,8 +33,17 @@ ATLAS_FLEX_API_VERSION_HEADER = "application/vnd.atlas.2024-11-13+json"
 # process-level request for DISK_PARTITION_IOPS_* returns a 404
 # INVALID_METRIC_NAME, so it's fetched separately via _get_disk_measurements.
 PROCESS_MEASUREMENTS = [
+    # PROCESS_CPU_USER/KERNEL are NOT normalized -- on a multi-vCPU tier,
+    # "50%" from these means one core saturated out of however many are
+    # available, not "half of this tier's total compute". The NORMALIZED
+    # variant scales to 0-100% of the tier's total allocation regardless of
+    # vCPU count, which is what "is this tier compute-saturated" actually
+    # needs -- kept both since the normalized metric isn't available on
+    # every tier (e.g. some shared tiers).
     "PROCESS_CPU_USER",
     "PROCESS_CPU_KERNEL",
+    "PROCESS_NORMALIZED_CPU_USER",
+    "PROCESS_NORMALIZED_CPU_KERNEL",
     "SYSTEM_MEMORY_USED",
     "SYSTEM_MEMORY_AVAILABLE",
     "CONNECTIONS",
@@ -84,7 +93,10 @@ def fetch_process_metrics(
             }
 
         per_process: dict[str, Any] = {}
-        for hostname_port in processes:
+        primary_host = None
+        for hostname_port, type_name in processes:
+            if type_name == "REPLICA_PRIMARY":
+                primary_host = hostname_port
             measurements = _get_measurements(
                 project_id, hostname_port, PROCESS_MEASUREMENTS, start, end, granularity, creds
             )
@@ -100,6 +112,10 @@ def fetch_process_metrics(
             "window_start": start.isoformat(),
             "window_end": end.isoformat(),
             "processes": per_process,
+            # None for single-node/shared tiers with no distinct primary
+            # (or if the primary wasn't resolvable) -- callers should fall
+            # back to averaging across all processes in that case.
+            "primary_host": primary_host,
         }
     except requests.RequestException as e:
         return {"available": False, "reason": f"Atlas API request failed: {e}"}
@@ -136,7 +152,7 @@ def _get_cluster_hostnames(project_id: str, cluster_name: str, creds: tuple[str,
     return {h.split(":")[0] for h in hosts_part.split(",") if h}
 
 
-def _list_processes(project_id: str, cluster_name: str, creds: tuple[str, str]) -> list[str]:
+def _list_processes(project_id: str, cluster_name: str, creds: tuple[str, str]) -> list[tuple[str, str]]:
     # Match by real hostname, not by cluster name string matching. Process
     # records' "id" field is an internal replica-set node name that doesn't
     # always contain the cluster's friendly name (this is normal for shared
@@ -156,7 +172,18 @@ def _list_processes(project_id: str, cluster_name: str, creds: tuple[str, str]) 
     )
     resp.raise_for_status()
     results = resp.json().get("results", [])
-    return [p["id"] for p in results if p.get("userAlias", "").split(":")[0] in hostnames]
+    # typeName distinguishes REPLICA_PRIMARY from REPLICA_SECONDARY -- callers
+    # need this because this driver (like most, with no custom read
+    # preference) sends every read and write to the primary only. Averaging
+    # a metric like CPU across all replica members, including idle
+    # secondaries, dilutes the one node that's actually doing the work --
+    # e.g. a real 15% primary blended with two ~1% idle secondaries reports
+    # as ~5.7%, looking far less loaded than it really is.
+    return [
+        (p["id"], p.get("typeName", ""))
+        for p in results
+        if p.get("userAlias", "").split(":")[0] in hostnames
+    ]
 
 
 def _get_measurements_with_fallback(

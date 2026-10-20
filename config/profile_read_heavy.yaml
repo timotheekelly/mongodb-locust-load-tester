@@ -1,4 +1,11 @@
 # Read-heavy: ~90%+ reads (point lookups + range queries), minimal writes.
+# aggregate_limit bounds the occasional aggregate task to a light, dashboard-
+# widget-style query -- without it, the same full-collection scan-and-group
+# cpu_intensive uses on purpose was taking 47-270+ seconds per call
+# regardless of load, dominating this profile's latency stats despite being
+# only 3% of its traffic.
+aggregate_limit: 500
+
 weights:
   insert: 1
   point_lookup: 45

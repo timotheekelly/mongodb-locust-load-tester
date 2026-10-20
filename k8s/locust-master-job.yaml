@@ -8,8 +8,11 @@
 # A Job (not a Deployment): in headless mode the master process exits once
 # LOCUST_RUN_TIME elapses (or the step-load shape ends the run) -- a
 # Deployment would restart it in a crash loop instead of letting it finish.
-# restartPolicy: Never + backoffLimit: 0 means a real failure surfaces as a
-# Failed Job instead of being silently retried.
+# restartPolicy: Never + backoffLimit: 2 means a real, persistent failure
+# still surfaces as a Failed Job, but a single transient scheduler
+# preemption (seen in practice during concurrent Autopilot node scale-up --
+# a higher-priority system pod preempting ours mid-schedule) gets one or
+# two retries instead of failing the whole run outright.
 #
 # Results (CSVs) are written to an emptyDir so `kubectl cp` can pull them
 # out of the pod -- but `kubectl cp` works by `exec`-ing a tar into the
@@ -29,7 +32,7 @@ metadata:
     app: locust
     role: master
 spec:
-  backoffLimit: 0
+  backoffLimit: 2
   template:
     metadata:
       labels:
@@ -65,9 +68,11 @@ spec:
             - name: results
               mountPath: /results
           resources:
+            # requests == limits (Guaranteed QoS) -- see the note in
+            # locust-worker-job.yaml on why this matters for Autopilot.
             requests:
-              cpu: "250m"
-              memory: "256Mi"
+              cpu: "1"
+              memory: "512Mi"
             limits:
               cpu: "1"
               memory: "512Mi"

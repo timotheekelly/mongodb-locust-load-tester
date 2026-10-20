@@ -1,4 +1,8 @@
 # Balanced 50/50: even split between reads and writes, typical OLTP-ish mix.
+# See profile_read_heavy.yaml's comment on aggregate_limit -- same reasoning
+# applies here.
+aggregate_limit: 500
+
 weights:
   insert: 15
   point_lookup: 25

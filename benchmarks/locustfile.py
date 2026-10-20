@@ -4,9 +4,9 @@ import threading
 import time
 
 from bson import BSON
-from locust import LoadTestShape, constant_throughput, events, task
+from locust import LoadTestShape, User, constant_throughput, events, task
 from locust.contrib.mongodb import MongoDBUser
-from pymongo import DESCENDING
+from pymongo import DESCENDING, MongoClient
 
 from benchmarks import docgen
 from benchmarks.config import load_config
@@ -21,6 +21,16 @@ _NESTING_DEPTH = _CFG.get("nesting_depth", 3)
 _NESTING_WIDTH = _CFG.get("nesting_width", 3)
 _MAX_FANOUT = _CFG.get("max_nesting_fanout", docgen.MAX_NESTING_FANOUT)
 _RANGE_LIMIT = _CFG.get("range_query_limit", 50)
+# None (default) = aggregate over every matching document -- appropriate
+# for cpu_intensive, which exists specifically to stress a full scan-and-
+# group. read_heavy/balanced set this to a small number instead, since an
+# occasional *light* aggregation (bounded, like a dashboard widget) is
+# realistic for those profiles; the same unbounded aggregation they
+# previously shared with cpu_intensive was taking 47-270+ seconds per call
+# on M10 regardless of offered load, dominating their latency stats for a
+# query shape that was never representative of what those profiles are
+# meant to measure.
+_AGGREGATE_LIMIT = _CFG.get("aggregate_limit")
 _BULK_BATCH = _CFG.get("bulk_insert_batch_size", 100)
 
 
@@ -58,6 +68,24 @@ def _fire(
         response_length=response_length,
         exception=exception,
     )
+
+
+def _fire_started() -> None:
+    """Fired once per task invocation, before any work happens -- gives
+    analyze_saturation.py a "started/sec" number distinct from "achieved
+    (completed)/sec". These can diverge for two different reasons that look
+    identical from achieved/sec alone: the cluster is rejecting/queuing
+    work it received (a real server-side limit), or this process never
+    even attempted that many ops/sec in the first place -- e.g. because
+    BenchUser.wait_time (constant_throughput) silently stops pacing once a
+    task takes longer than its target interval and the user falls into a
+    closed-loop "run flat out" pattern instead. response_time=0 here is
+    deliberately excluded from latency percentiles by only ever reading
+    this under request_type="META" -- see analyze_saturation.py, which
+    computes p95/achieved from the MONGODB-type rows only, not Locust's
+    combined "Aggregated" row, specifically so this doesn't contaminate
+    either."""
+    events.request.fire(request_type="META", name="STARTED", response_time=0, response_length=0)
 
 
 if os.environ.get("BENCH_STEP_LOAD", "").lower() in ("1", "true"):
@@ -156,6 +184,37 @@ class BenchUser(MongoDBUser):
     _next_sequence = 0
     _max_readable_sequence = -1  # fixed at startup: the pre-seeded range every process shares
     _own_inserted_count = 0      # this process's own inserts, tracked separately -- see _random_seq
+    _shared_client: MongoClient | None = None  # one MongoClient (and its pool) per process -- see __init__
+
+    def __init__(self, *args, **kwargs) -> None:
+        # Deliberately skips MongoDBUser.__init__, which opens a brand-new
+        # MongoClient (and its own connection pool) per simulated user. That's
+        # the opposite of MongoDB's own driver guidance ("create one
+        # MongoClient per process and reuse its pool"), and at any real
+        # offered load it floods the cluster with far more connections than
+        # a real application would -- in testing, an "offered load" of 1000
+        # req/s this way meant ~1000 separate connection pools, exceeding
+        # M30's connection limit (and tripping errors/latency) long before
+        # its actual CPU/IOPS capacity was anywhere near saturated. One
+        # shared client per process, reused by every simulated user here,
+        # matches how a real application would actually connect.
+        User.__init__(self, *args, **kwargs)
+        if BenchUser._shared_client is None:
+            with _init_lock:
+                if BenchUser._shared_client is None:
+                    BenchUser._shared_client = MongoClient(
+                        self.conn_string,
+                        maxPoolSize=_CFG.get("mongo_max_pool_size", 150),
+                        waitQueueTimeoutMS=_CFG.get("mongo_wait_queue_timeout_ms", 10000),
+                    )
+        self.client = BenchUser._shared_client
+
+    def on_stop(self) -> None:
+        # No-op: MongoDBUser.on_stop() closes self.client, which here is the
+        # process-wide shared client -- closing it when any single simulated
+        # user stops would break every other user still running in this
+        # process. The shared client just lives for the process's lifetime.
+        pass
 
     def on_start(self) -> None:
         self._coll = self.client[self.db_name][self.collection_name]
@@ -164,6 +223,18 @@ class BenchUser(MongoDBUser):
             with _init_lock:
                 if not BenchUser._initialized:
                     self._coll.create_index("seq", unique=True)
+                    # Compound, not single-field: backs both the $match
+                    # (category equality) AND the $sort-then-$limit in the
+                    # aggregate task below. A single-field category index
+                    # would support the match but not the sort, forcing a
+                    # blocking in-memory sort over every matched document
+                    # before the limit could apply -- reintroducing the
+                    # same cost the limit exists to avoid. Without any
+                    # index here, every AGGREGATE call was a full
+                    # collection scan before it even reached $group,
+                    # independent of offered load (confirmed: 47-274
+                    # SECONDS even at the lowest tested offered rate).
+                    self._coll.create_index([("category", 1), ("seq", 1)])
 
                     # Only used to size the readable range -- gaps from
                     # failed writes don't matter for that, so
@@ -233,6 +304,7 @@ class BenchUser(MongoDBUser):
 
     @task(_WEIGHTS.get("insert", 1))
     def insert_one(self):
+        _fire_started()
         seq = self._allocate_seq()
 
         doc = docgen.generate_document(
@@ -266,6 +338,7 @@ class BenchUser(MongoDBUser):
 
     @task(_WEIGHTS.get("point_lookup", 1))
     def point_lookup(self):
+        _fire_started()
         seq = self._random_seq()
 
         if seq is None:
@@ -293,6 +366,7 @@ class BenchUser(MongoDBUser):
 
     @task(_WEIGHTS.get("range_query", 1))
     def range_query(self):
+        _fire_started()
         start_seq = self._random_seq()
 
         if start_seq is None:
@@ -327,6 +401,7 @@ class BenchUser(MongoDBUser):
 
     @task(_WEIGHTS.get("update", 1))
     def update_one(self):
+        _fire_started()
         seq = self._random_seq()
 
         if seq is None:
@@ -364,6 +439,7 @@ class BenchUser(MongoDBUser):
 
     @task(_WEIGHTS.get("bulk_insert", 1))
     def bulk_insert(self):
+        _fire_started()
         sequences = [
             self._allocate_seq()
             for _ in range(_BULK_BATCH)
@@ -412,6 +488,7 @@ class BenchUser(MongoDBUser):
 
     @task(_WEIGHTS.get("aggregate", 1))
     def aggregate(self):
+        _fire_started()
         start = time.perf_counter()
 
         try:
@@ -423,6 +500,18 @@ class BenchUser(MongoDBUser):
                         )
                     }
                 },
+            ]
+            if _AGGREGATE_LIMIT is not None:
+                # $sort before $limit, not just $limit alone -- without an
+                # explicit order, which documents MongoDB returns first is
+                # unspecified and can vary between runs, so the subset
+                # entering $group wouldn't be reproducible. Sorting by
+                # "seq" is covered by the compound (category, seq) index
+                # above, so this stays an index-order scan, not a blocking
+                # in-memory sort.
+                pipeline.append({"$sort": {"seq": 1}})
+                pipeline.append({"$limit": _AGGREGATE_LIMIT})
+            pipeline += [
                 {
                     "$group": {
                         "_id": "$status",

@@ -8,6 +8,22 @@
 # A Job (not a Deployment) because a worker's locust process exits on its
 # own once the master shuts down at the end of a headless run -- a
 # Deployment would see that as a crash and restart it forever.
+#
+# requests == limits (Guaranteed QoS): with requests < limits (Burstable),
+# GKE Autopilot's bin-packing/consolidation pass can evict these pods
+# mid-run to repack nodes -- seen in practice as all workers getting a
+# kubelet-initiated SIGTERM and the sweep ending early with no error of our
+# own. Guaranteed QoS pods are the last to be considered for that kind of
+# eviction.
+#
+# backoffLimit: 3, not 0 -- QoS class doesn't protect against scheduler
+# *preemption* (a separate mechanism from eviction/consolidation), which
+# happens in practice during concurrent Autopilot node scale-up: a
+# higher-priority system pod can preempt one of ours to land on a node
+# that's still coming up. With backoffLimit: 0, that single transient
+# preemption failed the entire 8-pod Job even though the other 7 workers
+# were healthy. A few retries lets Kubernetes replace just the preempted
+# pod instead.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -18,7 +34,7 @@ metadata:
 spec:
   parallelism: 4
   completions: 4
-  backoffLimit: 0
+  backoffLimit: 3
   template:
     metadata:
       labels:
@@ -37,8 +53,8 @@ spec:
                 name: locust-secrets
           resources:
             requests:
-              cpu: "500m"
-              memory: "512Mi"
+              cpu: "2"
+              memory: "1Gi"
             limits:
               cpu: "2"
               memory: "1Gi"
